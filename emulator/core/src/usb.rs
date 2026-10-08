@@ -327,6 +327,12 @@ impl Usb {
         if self.waiting || self.ticks < self.deadline || self.phase >= 5 {
             return Ok(());
         }
+        if self.phase == 4 && self.cdc_interface.is_none() {
+            // A MIDI-only (or other non-CDC) device: enumeration is complete
+            // and there is no console line state to set.
+            self.phase = 5;
+            return Ok(());
+        }
         let setup = match self.phase {
             0 => [0x80, 6, 0, 1, 0, 0, 18, 0],
             1 => [0, 5, 1, 0, 0, 0, 0, 0],
@@ -337,8 +343,7 @@ impl Usb {
                 0x22,
                 1,
                 0,
-                self.cdc_interface
-                    .ok_or("USB configuration has no CDC interface")?,
+                self.cdc_interface.unwrap_or_default(),
                 0,
                 0,
                 0,

@@ -142,3 +142,22 @@ fn float_division_by_zero_follows_ieee() {
     c.step().unwrap();
     assert_eq!(f32::from_bits(c.r[6]), f32::INFINITY);
 }
+
+#[test]
+fn unsigned_immediate_branches_zero_extend_and_equality_sign_extends() {
+    // Vendor F940 ACBC: if (r0 >= 598) goto ... (unsigned literal). SLOOP's
+    // TIMER4 delay F9F1 81FB is if (r1 < 960); sign extension would loop
+    // forever. Vendor F846 820F: if (r6 == -447) keeps a signed literal.
+    let branch = |h: u16, x: u16, reg: usize, value: u32| {
+        let mut c = cpu(&[h, x]);
+        c.r[reg] = value;
+        c.step().unwrap();
+        c.pc != XIP + 4
+    };
+    assert!(branch(0xf940, 0xacbc, 0, 598));
+    assert!(!branch(0xf940, 0xacbc, 0, 597));
+    assert!(branch(0xf9f1, 0x81fb, 1, 959));
+    assert!(!branch(0xf9f1, 0x81fb, 1, 960));
+    assert!(branch(0xf846, 0x820f, 6, (-447i32) as u32));
+    assert!(!branch(0xf846, 0x820f, 6, 577));
+}

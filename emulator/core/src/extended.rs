@@ -847,11 +847,16 @@ pub(crate) fn execute(
                 }
                 Wide::BranchCompareImmediate => {
                     let kind = (h >> 7) & 63;
-                    let immediate = signed((((h >> 4) & 7) << 7) | (x >> 9), 10) as u32;
+                    // The 10-bit literal is zero-extended for the unsigned
+                    // relations (vendor F940 ACBC: if (r0 >= 598)) and
+                    // sign-extended for ==, != and the signed forms (vendor
+                    // F846 820F: if (r6 == -447)).
+                    let field = (((h >> 4) & 7) << 7) | (x >> 9);
+                    let immediate = field;
                     let v = cpu.r[n];
                     let test = match kind {
-                        0x30 => v == immediate,
-                        0x31 => v != immediate,
+                        0x30 => v == signed(field, 10) as u32,
+                        0x31 => v != signed(field, 10) as u32,
                         0x32 => v >= immediate,
                         0x33 => v < immediate,
                         0x38 => v > immediate,

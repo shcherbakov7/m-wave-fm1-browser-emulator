@@ -86,6 +86,16 @@ fn run() -> Result<(), String> {
             );
         }
     }
+    if let Ok(path) = env::var("FM1_LCD_PPM") {
+        // Optional binary PPM of the guest LCD (black while the panel is off).
+        let mut image = b"P6\n240 240\n255\n".to_vec();
+        let visible = cpu.bus.screen_visible();
+        for &rgb in &cpu.bus.lcd.pixels {
+            let rgb = if visible { rgb } else { 0 };
+            image.extend_from_slice(&[(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]);
+        }
+        std::fs::write(&path, image).map_err(|e| format!("{path}: {e}"))?;
+    }
     let words: Vec<String> = (0..4)
         .map(|i| {
             cpu.bus
