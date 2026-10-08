@@ -1,0 +1,7 @@
+[package]
+name = "fm1-emu"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "pi32v2 interpreter and FM-1 board model for unchanged M-VAVE FM-1 firmware"
+default-run = "fm1-emu"

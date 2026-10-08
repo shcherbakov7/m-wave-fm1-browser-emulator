@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["core"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
