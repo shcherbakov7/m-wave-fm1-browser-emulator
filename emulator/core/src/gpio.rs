@@ -8,6 +8,27 @@ pub const DIE: u32 = 12;
 pub const PU: u32 = 16;
 pub const PD: u32 = 20;
 
+/// Panel control IDs by matrix position: `PANEL_KEYMAP[row - 1][column]`.
+/// IDs 0..=1 are OCT−/OCT+, 2..=13 are FX, SEL, ENV, LFO, EDIT, GLO, HOME,
+/// SAVE, ARP, SEQ, PLAY/STOP, REC, and 14..=40 are the 27 note keys from
+/// the lowest. Wiring from fm1_input.h and the Felucca panel.c defaults.
+pub const PANEL_KEYMAP: [[i8; 11]; 4] = [
+    [5, 11, 4, 10, 3, 9, 2, 8, -1, -1, -1],
+    [34, 35, 36, 37, 38, 40, 39, 13, 7, 6, 12],
+    [23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33],
+    [0, 1, 15, 14, 17, 16, 19, 18, 20, 21, 22],
+];
+pub const PANEL_CONTROLS: usize = 41;
+
+/// Matrix `(column, row)` contact for a panel control ID.
+pub fn panel_contact(id: usize) -> Option<(usize, usize)> {
+    PANEL_KEYMAP.iter().enumerate().find_map(|(row, ids)| {
+        ids.iter()
+            .position(|&value| value >= 0 && value as usize == id)
+            .map(|column| (column, row + 1))
+    })
+}
+
 pub struct Gpio {
     ports: [[u32; 8]; 8],
     matrix: [u8; 11],

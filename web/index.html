@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FM-1 Emulator</title>
+  <meta name="description" content="Браузерный эмулятор M-VAVE FM-1: запускает немодифицированные прошивки .fwsc">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="bar">
+    <h1>FM-1 <span>эмулятор</span></h1>
+    <div class="actions">
+      <label class="button primary" title="Открыть файл прошивки (.fwsc, .ufw, .bin, .elf)">
+        Загрузить прошивку
+        <input id="file" type="file" accept=".fwsc,.ufw,.bin,.elf" hidden>
+      </label>
+      <select id="recent" title="Ранее загруженные прошивки"><option value="">Недавние…</option></select>
+      <button id="pause" class="button" disabled>Пауза</button>
+      <button id="restart" class="button" disabled>Перезапуск</button>
+      <button id="sound" class="button" title="Включить звук">🔇 Звук</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="device" class="device" aria-label="Панель FM-1">
+      <div class="screen-bezel"><canvas id="lcd" width="240" height="240" aria-label="Экран"></canvas>
+        <div id="drop-hint" class="drop-hint">Перетащите сюда файл прошивки<br><small>.fwsc · .ufw · .bin · .elf</small></div>
+      </div>
+    </section>
+
+    <section class="info">
+      <div id="state" class="state">Нет прошивки</div>
+      <dl class="stats">
+        <div><dt>Скорость</dt><dd id="speed">—</dd></div>
+        <div><dt>Шаги CPU</dt><dd id="steps">—</dd></div>
+        <div><dt>Время устройства</dt><dd id="guest-time">—</dd></div>
+        <div><dt>Прерывания</dt><dd id="irqs">—</dd></div>
+      </dl>
+      <details class="help" open>
+        <summary>Управление</summary>
+        <p>Мышь или касание: кнопки и клавиши (удерживайте). Клавиатура:</p>
+        <ul>
+          <li><kbd>Z</kbd>…<kbd>/</kbd> и <kbd>S</kbd> <kbd>D</kbd> <kbd>F</kbd> <kbd>H</kbd> <kbd>J</kbd> <kbd>L</kbd> <kbd>;</kbd> — нижняя часть клавиатуры</li>
+          <li><kbd>1</kbd> <kbd>Q</kbd>…<kbd>Y</kbd> и <kbd>3</kbd> <kbd>4</kbd> <kbd>6</kbd> — верхняя часть</li>
+          <li><kbd>←</kbd> <kbd>→</kbd> — OCT− / OCT+, <kbd>Esc</kbd> — HOME</li>
+        </ul>
+        <p class="note">Ручки пока не эмулируются. Эмуляция работает медленнее реального устройства, поэтому звук прерывистый.</p>
+      </details>
+      <details class="console">
+        <summary>USB-консоль прошивки</summary>
+        <pre id="serial"></pre>
+        <form id="serial-form"><input id="serial-input" placeholder="команда (например help) и Enter" autocomplete="off"></form>
+      </details>
+    </section>
+  </main>
+
+  <footer>
+    GPL-3.0 · Ядро основано на <a href="https://github.com/simonjohansson/fm1-emulator">fm1-emulator</a> ·
+    Прошивки не входят в комплект, загружайте свои.
+  </footer>
+  <script src="app.js" type="module"></script>
+</body>
+</html>

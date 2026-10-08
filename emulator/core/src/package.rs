@@ -203,21 +203,33 @@ fn entry(data: &[u8]) -> Result<(usize, usize), String> {
     Ok((u32_at(data, 4)? as usize, u32_at(data, 8)? as usize))
 }
 
+/// The FM-1 product identity interleaved into the first 960 package bytes.
+pub(crate) fn product_identity(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() < 960 {
+        return None;
+    }
+    let product: Vec<u8> = (0..20)
+        .filter_map(|i| {
+            let marker = raw[i * 48 + 47];
+            (marker != 0x7d).then(|| marker.wrapping_sub(i as u8 + 1))
+        })
+        .collect();
+    (product.starts_with(b"FM-1_")
+        && product.len() > 5
+        && product[5..].iter().all(u8::is_ascii_digit))
+    .then_some(product)
+}
+
+pub(crate) fn looks_like_package(raw: &[u8]) -> bool {
+    product_identity(raw).is_some()
+}
+
 impl Package {
     pub fn decode(raw: &[u8]) -> Result<(Self, Vec<u8>), String> {
         if raw.len() < 960 {
             return Err("FWSC package is too short".into());
         }
-        let product: Vec<u8> = (0..20)
-            .filter_map(|i| {
-                let marker = raw[i * 48 + 47];
-                (marker != 0x7d).then(|| marker.wrapping_sub(i as u8 + 1))
-            })
-            .collect();
-        if !product.starts_with(b"FM-1_")
-            || product.len() <= 5
-            || !product[5..].iter().all(u8::is_ascii_digit)
-        {
+        if product_identity(raw).is_none() {
             return Err("package identity is not FM-1".into());
         }
         let mut logical = Vec::with_capacity(raw.len() - 20);

@@ -1,0 +1,286 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//! Plain C-ABI exports for the browser. One emulator instance per module
+//! instance; the JavaScript worker owns it and calls these functions only from
+//! its own thread. Buffers are exchanged through linear memory.
+use fm1_emu::{
+    cpu::Cpu,
+    firmware::Firmware,
+    gpio::{panel_contact, PANEL_CONTROLS},
+};
+use std::cell::RefCell;
+
+/// Guest steps a key stays closed after a press, so that even a short click
+/// lasts long enough (about 100 ms of guest time) for firmware scan/debounce.
+const MIN_PRESS_STEPS: u64 = 72_000_000;
+const LCD_PIXELS: usize = 240 * 240;
+
+struct Machine {
+    cpu: Option<Cpu>,
+    fault: Option<String>,
+    message: Vec<u8>,
+    lcd_rgba: Vec<u8>,
+    lcd_seen: Option<(u64, bool)>,
+    held: [bool; PANEL_CONTROLS],
+    release_after: [u64; PANEL_CONTROLS],
+    closed: [bool; PANEL_CONTROLS],
+}
+
+impl Machine {
+    fn new() -> Self {
+        Self {
+            cpu: None,
+            fault: None,
+            message: Vec::new(),
+            lcd_rgba: vec![0; LCD_PIXELS * 4],
+            lcd_seen: None,
+            held: [false; PANEL_CONTROLS],
+            release_after: [0; PANEL_CONTROLS],
+            closed: [false; PANEL_CONTROLS],
+        }
+    }
+
+    fn set_message(&mut self, text: &str) -> usize {
+        self.message.clear();
+        self.message.extend_from_slice(text.as_bytes());
+        self.message.len()
+    }
+
+    fn load(&mut self, data: Vec<u8>) -> Result<(), String> {
+        let firmware = Firmware::from_bytes(data)?;
+        let mut cpu = Cpu::new(firmware.bus()?, firmware.entry);
+        // Application handoff: the SPL's boot-parameter pointer in r0.
+        cpu.r[0] = 0x01c7_fe08;
+        *self = Self::new();
+        self.cpu = Some(cpu);
+        Ok(())
+    }
+
+    /// Apply held/minimum-duration key state to the guest matrix.
+    fn sync_keys(&mut self) {
+        let Some(cpu) = &mut self.cpu else { return };
+        for id in 0..PANEL_CONTROLS {
+            let closed = self.held[id] || cpu.steps < self.release_after[id];
+            if closed != self.closed[id] {
+                if let Some((column, row)) = panel_contact(id) {
+                    let _ = cpu.bus.devices.gpio.press(column, row, closed);
+                }
+                self.closed[id] = closed;
+            }
+        }
+    }
+
+    fn run(&mut self, steps: u32) -> i32 {
+        if self.fault.is_some() {
+            return 1;
+        }
+        if self.cpu.is_none() {
+            return 2;
+        }
+        // Re-check key release timing at a bounded granularity.
+        let mut remaining = steps;
+        while remaining > 0 {
+            let chunk = remaining.min(1 << 20);
+            let cpu = self.cpu.as_mut().unwrap();
+            for _ in 0..chunk {
+                if let Err(error) = cpu.step() {
+                    self.fault = Some(format!("{error} (after {} steps)", cpu.steps));
+                    return 1;
+                }
+            }
+            remaining -= chunk;
+            self.sync_keys();
+        }
+        0
+    }
+
+    /// Convert the LCD to RGBA when it changed since the previous call.
+    fn lcd(&mut self) -> bool {
+        let Some(cpu) = &self.cpu else { return false };
+        let visible = cpu.bus.screen_visible();
+        let state = (cpu.bus.lcd.pixels_written, visible);
+        if self.lcd_seen == Some(state) {
+            return false;
+        }
+        self.lcd_seen = Some(state);
+        for (rgba, &rgb) in self.lcd_rgba.chunks_exact_mut(4).zip(&cpu.bus.lcd.pixels) {
+            let rgb = if visible { rgb } else { 0 };
+            rgba[0] = (rgb >> 16) as u8;
+            rgba[1] = (rgb >> 8) as u8;
+            rgba[2] = rgb as u8;
+            rgba[3] = 255;
+        }
+        true
+    }
+}
+
+thread_local! {
+    static MACHINE: RefCell<Machine> = RefCell::new(Machine::new());
+}
+
+fn with<T>(f: impl FnOnce(&mut Machine) -> T) -> T {
+    MACHINE.with(|machine| f(&mut machine.borrow_mut()))
+}
+
+/// Allocate `len` bytes for the host to fill.
+#[no_mangle]
+pub extern "C" fn fm1_alloc(len: usize) -> *mut u8 {
+    let mut buffer = Vec::<u8>::with_capacity(len.max(1));
+    let ptr = buffer.as_mut_ptr();
+    std::mem::forget(buffer);
+    ptr
+}
+
+/// Free a buffer from `fm1_alloc` that was not passed to `fm1_load`.
+///
+/// # Safety
+/// `ptr`/`len` must come from one `fm1_alloc(len)` call.
+#[no_mangle]
+pub unsafe extern "C" fn fm1_free(ptr: *mut u8, len: usize) {
+    drop(Vec::from_raw_parts(ptr, 0, len.max(1)));
+}
+
+/// Load firmware from an `fm1_alloc` buffer (ownership passes here).
+/// Returns 0 on success; otherwise the error is in the message buffer.
+///
+/// # Safety
+/// `ptr`/`len` must come from one `fm1_alloc(len)` call, fully initialized.
+#[no_mangle]
+pub unsafe extern "C" fn fm1_load(ptr: *mut u8, len: usize) -> i32 {
+    let data = Vec::from_raw_parts(ptr, len, len.max(1));
+    with(|m| match m.load(data) {
+        Ok(()) => 0,
+        Err(error) => {
+            m.set_message(&error);
+            1
+        }
+    })
+}
+
+/// Execute up to `steps` guest steps. 0 = ran, 1 = fault (see message),
+/// 2 = nothing loaded.
+#[no_mangle]
+pub extern "C" fn fm1_run(steps: u32) -> i32 {
+    with(|m| {
+        let status = m.run(steps);
+        if status == 1 {
+            let fault = m.fault.clone().unwrap_or_default();
+            m.set_message(&fault);
+        }
+        status
+    })
+}
+
+/// Press (1) or release (0) a panel control (see `PANEL_KEYMAP`).
+#[no_mangle]
+pub extern "C" fn fm1_key(id: u32, down: u32) {
+    with(|m| {
+        let id = id as usize;
+        if id >= PANEL_CONTROLS {
+            return;
+        }
+        m.held[id] = down != 0;
+        if down != 0 {
+            let steps = m.cpu.as_ref().map_or(0, |cpu| cpu.steps);
+            m.release_after[id] = steps + MIN_PRESS_STEPS;
+        }
+        m.sync_keys();
+    })
+}
+
+/// Pointer to the 240×240 RGBA frame if it changed since the last call, else 0.
+#[no_mangle]
+pub extern "C" fn fm1_lcd() -> *const u8 {
+    with(|m| {
+        if m.lcd() {
+            m.lcd_rgba.as_ptr()
+        } else {
+            std::ptr::null()
+        }
+    })
+}
+
+/// Move up to `max_frames` stereo frames of guest audio into `out` as
+/// interleaved f32 in [-1, 1]. Returns the number of frames written.
+///
+/// # Safety
+/// `out` must hold `2 * max_frames` f32 values.
+#[no_mangle]
+pub unsafe extern "C" fn fm1_audio(out: *mut f32, max_frames: usize) -> usize {
+    with(|m| {
+        let Some(cpu) = &mut m.cpu else { return 0 };
+        let out = std::slice::from_raw_parts_mut(out, max_frames * 2);
+        let samples = &mut cpu.bus.audio.samples;
+        let count = samples.len().min(max_frames);
+        for (frame, [left, right]) in out.chunks_exact_mut(2).zip(samples.drain(..count)) {
+            // ALNK words carry 24-bit samples in the low bits.
+            frame[0] = (left << 8 >> 8) as f32 / 8_388_608.0;
+            frame[1] = (right << 8 >> 8) as f32 / 8_388_608.0;
+        }
+        count
+    })
+}
+
+/// Move up to `max` bytes of USB CDC console output into `out`.
+///
+/// # Safety
+/// `out` must hold `max` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fm1_serial(out: *mut u8, max: usize) -> usize {
+    with(|m| {
+        let Some(cpu) = &mut m.cpu else { return 0 };
+        let out = std::slice::from_raw_parts_mut(out, max);
+        let count = cpu.bus.usb.serial.len().min(max);
+        for (slot, byte) in out.iter_mut().zip(cpu.bus.usb.serial.drain(..count)) {
+            *slot = byte;
+        }
+        count
+    })
+}
+
+/// Offer console input to the guest's USB CDC OUT endpoint. Returns 1 when
+/// accepted; 0 means retry later.
+///
+/// # Safety
+/// `ptr` must hold `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fm1_serial_in(ptr: *const u8, len: usize) -> i32 {
+    let bytes = std::slice::from_raw_parts(ptr, len);
+    with(|m| match &mut m.cpu {
+        Some(cpu) => cpu.bus.usb.receive_serial(bytes) as i32,
+        None => 0,
+    })
+}
+
+/// Write a JSON status object into the message buffer; returns its length.
+#[no_mangle]
+pub extern "C" fn fm1_status() -> usize {
+    with(|m| {
+        let text = match &m.cpu {
+            None => "{\"loaded\":false}".to_string(),
+            Some(cpu) => format!(
+                "{{\"loaded\":true,\"steps\":{},\"irqs\":{},\"lcdPixels\":{},\"visible\":{},\
+                 \"audioFrames\":{},\"watchdogFeeds\":{},\"fault\":{}}}",
+                cpu.steps,
+                cpu.irq_entries,
+                cpu.bus.lcd.pixels_written,
+                cpu.bus.screen_visible(),
+                cpu.bus.audio.frames,
+                cpu.bus.system.watchdog_feeds,
+                m.fault
+                    .as_ref()
+                    .map_or("null".to_string(), |f| format!("{f:?}")),
+            ),
+        };
+        m.set_message(&text)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn fm1_message_ptr() -> *const u8 {
+    with(|m| m.message.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn fm1_message_len() -> usize {
+    with(|m| m.message.len())
+}

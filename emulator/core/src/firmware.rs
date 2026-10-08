@@ -48,6 +48,23 @@ impl Firmware {
         }
     }
 
+    /// Load from memory, choosing the format by content: an FM-1 `.fwsc`/`.ufw`
+    /// package, an ELF32-pi32v2 executable, or a raw application image.
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
+        if data.starts_with(b"\x7fELF") {
+            return Self::from_elf(&data);
+        }
+        match crate::package::Package::decode(&data) {
+            Ok((package, image)) => {
+                let mut firmware = Self::from_raw(image)?;
+                firmware.package = Some(package);
+                Ok(firmware)
+            }
+            Err(package_error) if crate::package::looks_like_package(&data) => Err(package_error),
+            Err(_) => Self::from_raw(data),
+        }
+    }
+
     pub fn from_raw(image: Vec<u8>) -> Result<Self, String> {
         if image.is_empty() || image.len() > (XIP_END - XIP) as usize {
             return Err("application image is empty or exceeds the XIP window".into());
