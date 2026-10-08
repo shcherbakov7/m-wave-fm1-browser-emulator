@@ -31,6 +31,9 @@ impl Guards {
             || (0x1eee340..=0x1eee358).contains(&a)
             || (0x1eef2d0..=0x1eef2e4).contains(&a)
             || (0x41c00..=0x41c18).contains(&a)
+            // corex2 performance counters (SDK csfr.h C0_*_UACNT/TL_CKCNT).
+            // Not modeled: they read as stopped, so X0X falls back to TIMER4.
+            || (0x1eee200..0x1eee220).contains(&a)
     }
     fn value(&self, a: u32) -> u32 {
         *self.registers.get(&a).unwrap_or(&0)

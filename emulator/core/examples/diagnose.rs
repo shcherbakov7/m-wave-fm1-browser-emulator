@@ -86,6 +86,14 @@ fn run() -> Result<(), String> {
             );
         }
     }
+    let words: Vec<String> = (0..4)
+        .map(|i| {
+            cpu.bus
+                .read(cpu.pc.wrapping_add(i * 2), 2)
+                .map_or("????".into(), |w| format!("{w:04x}"))
+        })
+        .collect();
+    eprintln!("words at pc: {}", words.join(" "));
     eprintln!("recent completed instructions:");
     for (pc, op) in recent {
         eprintln!("  {}: {op}", location(&firmware.symbols, pc));

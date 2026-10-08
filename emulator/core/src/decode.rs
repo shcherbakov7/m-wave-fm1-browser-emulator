@@ -136,6 +136,10 @@ pub(crate) enum Wide {
     WordRegisterPreincrementStore,
     WordRegisterPreincrement,
     HalfwordRegisterPreincrement,
+    HalfwordRegisterPreincrementStore,
+    PairPostincrement,
+    PairIndexed,
+    PairRegisterPreincrement,
     WordPostincrementStore,
     WordPostincrementLoad,
     MemoryIndexed,
@@ -357,8 +361,23 @@ fn wide(h: u32, x: u32) -> Wide {
     if h & 0xfff8 == 0xed50 || h & 0xfff8 == 0xed58 {
         return Wide::HalfwordExtended;
     }
-    if h == 0xedd0 || h == 0xedd4 && x & 1 == 0 {
+    // EDD0..EDD3: unsigned load/store; EDD4..EDD7: signed load. The opcode's
+    // low two bits are the top of a signed 10-bit stride (vendor objdump:
+    // EDD3 0D3F is h[r0++=-4] = r3).
+    if h & 0xfffc == 0xedd0 || h & 0xfffc == 0xedd4 && x & 1 == 0 {
         return Wide::HalfwordPostincrement;
+    }
+    // Doubleword (register pair) forms, the EC58 analogue of ECD8 (vendor
+    // objdump: EC58 2008 r3_r2 = d[r0++=8]; EC58 040A r1_r0 = d[r0+r4<<3];
+    // EC5C 4012 r5_r4 = d[++r1=r0]).
+    if h & 0xfff8 == 0xec58 && x & 3 < 2 {
+        return Wide::PairPostincrement;
+    }
+    if h == 0xec58 && matches!(x & 15, 2 | 3 | 10 | 11) {
+        return Wide::PairIndexed;
+    }
+    if h == 0xec5c && matches!(x & 15, 2 | 3) {
+        return Wide::PairRegisterPreincrement;
     }
     if h == 0xeed2 {
         return Wide::BytePostincrementStore;
@@ -482,11 +501,13 @@ fn wide(h: u32, x: u32) -> Wide {
             | 0x92
             | 0x93
             | 0x99
+            | 0x9a
             | 0x9b
             | 0xa1
             | 0xa2
             | 0xa3
             | 0xc1
+            | 0xc2
             | 0xc3
             | 0xc9
             | 0xca
@@ -501,6 +522,7 @@ fn wide(h: u32, x: u32) -> Wide {
             | 0xe2
             | 0xe3
             | 0xe9
+            | 0xea
             | 0xeb
     ) && h & 0xf000 == 0xe000
     {
@@ -533,7 +555,11 @@ fn wide(h: u32, x: u32) -> Wide {
     {
         return Wide::BranchCompareImmediate;
     }
-    if matches!(h & 0xfff0, 0xed00 | 0xed80 | 0xee00 | 0xee80) && x & 0xe00 == 0x800 {
+    if matches!(
+        h & 0xfff0,
+        0xe800 | 0xe880 | 0xe900 | 0xe980 | 0xec00 | 0xec80 | 0xed00 | 0xed80 | 0xee00 | 0xee80
+    ) && x & 0xe00 == 0x800
+    {
         return Wide::BranchCompareFloat;
     }
     if matches!(
@@ -552,6 +578,14 @@ fn wide(h: u32, x: u32) -> Wide {
     if h & 0xfff8 == 0xecd0 {
         return Wide::WordExtended;
     }
+    // ECD8..ECDF with x&3 < 2: the opcode's low bits are the signed high
+    // stride (vendor ECDA 0014 adds 516). Checked before ECDC's register forms.
+    if h & 0xfff8 == 0xecd8 && x & 3 == 1 {
+        return Wide::WordPostincrementStore;
+    }
+    if h & 0xfff8 == 0xecd8 && x & 3 == 0 {
+        return Wide::WordPostincrementLoad;
+    }
     if h == 0xecdc && x & 15 == 3 {
         return Wide::WordRegisterPreincrementStore;
     }
@@ -561,12 +595,10 @@ fn wide(h: u32, x: u32) -> Wide {
     if h == 0xeddc && matches!(x & 15, 0 | 2) {
         return Wide::HalfwordRegisterPreincrement;
     }
-    if h == 0xecd8 && x & 3 == 1 {
-        return Wide::WordPostincrementStore;
+    if h == 0xeddc && x & 15 == 1 && (x >> 4) & 15 != x >> 12 {
+        return Wide::HalfwordRegisterPreincrementStore;
     }
-    if h == 0xecd8 && x & 3 == 0 {
-        return Wide::WordPostincrementLoad;
-    }
+
     if matches!(h, 0xecd8 | 0xedd8 | 0xeed8) {
         return Wide::MemoryIndexed;
     }

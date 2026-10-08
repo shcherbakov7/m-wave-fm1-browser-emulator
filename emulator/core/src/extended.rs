@@ -272,7 +272,8 @@ pub(crate) fn execute(
                     op = "halfword_extended";
                 }
                 Wide::HalfwordPostincrement => {
-                    let increment = ((x >> 8) & 15) * 16 + (x & 14);
+                    let increment =
+                        signed(((h & 3) << 8) | (((x >> 8) & 15) << 4) | (x & 14), 10) as u32;
                     let address = cpu.r[s];
                     mem = Some((
                         d,
@@ -633,6 +634,43 @@ pub(crate) fn execute(
                     mem = Some((d, 0, cpu.sr[14] + (x & 4092), 4, x & 1 != 0, false, None));
                     op = "stack_extended";
                 }
+                kind @ (Wide::PairPostincrement
+                | Wide::PairIndexed
+                | Wide::PairRegisterPreincrement) => {
+                    let base = cpu.r[s];
+                    let (address, updated) = match kind {
+                        Wide::PairPostincrement => {
+                            let stride = (signed(h & 7, 3) << 8)
+                                + ((((x >> 8) & 15) << 4) | (x & 12)) as i32;
+                            (base, Some(base.wrapping_add(stride as u32)))
+                        }
+                        Wide::PairIndexed => {
+                            let shift = if x & 8 != 0 { 3 } else { 0 };
+                            (base.wrapping_add(cpu.r[c] << shift), None)
+                        }
+                        _ => {
+                            let address = base.wrapping_add(cpu.r[c]);
+                            (address, Some(address))
+                        }
+                    };
+                    let reg = d & 14;
+                    if x & 1 != 0 {
+                        cpu.write(address, cpu.r[reg])?;
+                        cpu.write(address.wrapping_add(4), cpu.r[reg + 1])?;
+                        if let Some(updated) = updated {
+                            cpu.r[s] = updated;
+                        }
+                    } else {
+                        let low = cpu.read(address, 4)?;
+                        let high = cpu.read(address.wrapping_add(4), 4)?;
+                        if let Some(updated) = updated {
+                            cpu.r[s] = updated;
+                        }
+                        cpu.r[reg] = low;
+                        cpu.r[reg + 1] = high;
+                    }
+                    op = "memory_pair_extended";
+                }
                 Wide::MemoryPair => {
                     let offset =
                         (signed(h & 7, 3) << 8) | (((x >> 8) & 15) << 4) as i32 | (x & 12) as i32;
@@ -729,7 +767,9 @@ pub(crate) fn execute(
                             0x81..=0x83 => lhs == rhs,
                             0x89..=0x8b => lhs != rhs,
                             0x91..=0x93 => lhs >= rhs,
-                            0x99 | 0x9b => lhs < rhs,
+                            // Kind bits: 1 register, 2 packed, 3 literal operand;
+                            // bit 3 negates; the high nibble selects the compare.
+                            0x99..=0x9b => lhs < rhs,
                             0xa1 => {
                                 if x & 128 == 0 {
                                     lhs & rhs == 0
@@ -739,7 +779,7 @@ pub(crate) fn execute(
                             }
                             0xa2 => lhs & rhs == 0,
                             0xa3 => lhs & rhs != 0,
-                            0xc1 | 0xc3 => lhs > rhs,
+                            0xc1..=0xc3 => lhs > rhs,
                             0xc9..=0xcb => lhs <= rhs,
                             0xd1..=0xd3 => (lhs as i32) >= (rhs as i32),
                             0xd9..=0xdb => (lhs as i32) < (rhs as i32),
@@ -827,25 +867,23 @@ pub(crate) fn execute(
                     op = "branch_compare_immediate";
                 }
                 Wide::BranchCompareFloat => {
+                    // Operand bit 11 selects an f32 comparison. Each negated
+                    // opcode is the exact negation of its partner (vendor
+                    // `iff (r1 >=/u< r2)`), so NaN makes ED80/EE80 true. The
+                    // unsigned-form opcodes are taken as the unordered variants
+                    // (true on NaN) with ordered negations, as compilers pair
+                    // integer and float predicates.
                     let lhs = f32::from_bits(cpu.r[d]);
                     let rhs = f32::from_bits(cpu.r[n]);
-                    if !lhs.is_finite() || !rhs.is_finite() {
-                        return Err(Fault::Access {
-                            pc,
-                            fault: crate::bus::AccessFault {
-                                address: pc,
-                                size: 4,
-                                operation: "floating-point branch",
-                                reason: "exceptional floating-point comparison is not implemented",
-                            },
-                        });
-                    }
-                    let test = match h & 0xfff0 {
-                        0xed00 => lhs >= rhs,
-                        0xed80 => lhs < rhs,
-                        0xee00 => lhs > rhs,
-                        _ => lhs <= rhs,
+                    let unordered = lhs.is_nan() || rhs.is_nan();
+                    let positive = match h & 0xff00 | (h & 0x80) {
+                        0xe800 | 0xe880 => lhs == rhs,
+                        0xe900 | 0xe980 => unordered || lhs >= rhs,
+                        0xec00 | 0xec80 => unordered || lhs > rhs,
+                        0xed00 | 0xed80 => lhs >= rhs,
+                        _ => lhs > rhs,
                     };
+                    let test = positive != (h & 0x80 != 0);
                     if test {
                         next = next.wrapping_add((signed(x & 511, 9) * 2) as u32);
                     }
@@ -919,6 +957,15 @@ pub(crate) fn execute(
                     cpu.r[d] = value;
                     op = "word_register_preincrement";
                 }
+                Wide::HalfwordRegisterPreincrementStore => {
+                    // Vendor EDDC 0B31: [++rS=rC] = low halfword of rD.
+                    let address = cpu.r[s].wrapping_add(cpu.r[c]);
+                    cpu.r[s] = address;
+                    cpu.bus
+                        .write(address, cpu.r[d] & 0xffff, 2)
+                        .map_err(|fault| Fault::Access { pc: cpu.pc, fault })?;
+                    op = "halfword_register_preincrement_store";
+                }
                 Wide::HalfwordRegisterPreincrement => {
                     let address = cpu.r[s].wrapping_add(cpu.r[c]);
                     let value = cpu.read(address, 2)?;
@@ -931,7 +978,8 @@ pub(crate) fn execute(
                     op = "halfword_register_preincrement";
                 }
                 Wide::WordPostincrementStore => {
-                    let increment = (((x >> 8) & 15) << 4) | (x & 12);
+                    let increment = ((signed(h & 7, 3) << 8) as u32)
+                        .wrapping_add((((x >> 8) & 15) << 4) | (x & 12));
                     let address = cpu.r[s];
                     mem = Some((
                         d,
@@ -945,7 +993,8 @@ pub(crate) fn execute(
                     op = "word_postincrement_store";
                 }
                 Wide::WordPostincrementLoad => {
-                    let increment = (((x >> 8) & 15) << 4) | (x & 12);
+                    let increment = ((signed(h & 7, 3) << 8) as u32)
+                        .wrapping_add((((x >> 8) & 15) << 4) | (x & 12));
                     let address = cpu.r[s];
                     mem = Some((
                         d,

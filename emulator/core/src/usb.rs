@@ -2,13 +2,17 @@
 // USB0 register bridge and a small USB host for the CDC console.
 use crate::RAM;
 use std::collections::VecDeque;
+
+/// EP0..EP4. Felucca-family firmware with USB audio also uses EP4, whose
+/// count/address registers sit apart at 0x34/0x38/0x3c.
+const ENDPOINTS: usize = 5;
 #[derive(Default)]
 pub struct Usb {
     regs: [u32; 16],
     io: u32,
     clock: u32,
     sie: [u8; 16],
-    endpoints: [[u8; 8]; 4],
+    endpoints: [[u8; 8]; ENDPOINTS],
     index: usize,
     ticks: u64,
     deadline: u64,
@@ -180,12 +184,14 @@ impl Usb {
         self.deadline = self.ticks + 24000;
     }
     fn send(&mut self, ep: usize, ram: &mut [u8]) -> Result<(), &'static str> {
-        let n = self.regs[2 + ep] as usize;
+        let n = self.regs[if ep == 4 { 13 } else { 2 + ep }] as usize;
         if n > 64 {
             return Err("USB full-speed packet exceeds 64 bytes");
         }
         let a = if ep == 0 {
             self.regs[6]
+        } else if ep == 4 {
+            self.regs[14]
         } else {
             self.regs[7 + (ep - 1) * 2]
         };
@@ -223,7 +229,7 @@ impl Usb {
                     self.phase = 0;
                     self.waiting = false;
                     self.sie = [0; 16];
-                    self.endpoints = [[0; 8]; 4];
+                    self.endpoints = [[0; 8]; ENDPOINTS];
                     self.cdc_interface = None;
                     self.cdc_endpoint = None;
                     self.cdc_out = None;
@@ -251,7 +257,7 @@ impl Usb {
                 } else {
                     let data = v as u8;
                     if r == 14 {
-                        if data > 3 {
+                        if data as usize >= ENDPOINTS {
                             return Err("USB endpoint index exceeds modeled controller");
                         }
                         self.index = data as usize;

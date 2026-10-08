@@ -1904,10 +1904,25 @@ fn floating_branches_match_the_fm1_994_capture_without_changing_psr() {
         c.step().unwrap();
         assert_eq!(c.pc, expected);
     }
-    for exceptional in [0x7fc00000, 0x7f800000, 0xff800000] {
-        let mut c = cpu(&[0xee82, 0x1801]);
-        c.r[1] = exceptional;
-        assert!(c.step().is_err());
+    // Infinities order normally; NaN fails the ordered EE02 test, so its
+    // negation EE82 is taken.
+    for (lhs, ee02) in [(0x7f800000, true), (0xff800000, false), (0x7fc00000, false)] {
+        for (h, taken) in [(0xee02, ee02), (0xee82, !ee02)] {
+            let mut c = cpu(&[h, 0x1801]);
+            c.r[1] = lhs;
+            c.r[2] = 0x3f800000;
+            c.step().unwrap();
+            assert_eq!(c.pc, XIP + if taken { 6 } else { 4 });
+        }
+    }
+    // Unsigned-form opcodes are the unordered variants: E902 (u>=) is taken
+    // for NaN and its negation E982 is not.
+    for (h, taken) in [(0xe902, true), (0xe982, false), (0xe802, false), (0xe882, true)] {
+        let mut c = cpu(&[h, 0x1801]);
+        c.r[1] = 0x7fc00000;
+        c.r[2] = 0x3f800000;
+        c.step().unwrap();
+        assert_eq!(c.pc, XIP + if taken { 6 } else { 4 });
     }
 }
 
@@ -1954,8 +1969,16 @@ fn floating_pitch_conditions_compare_values_instead_of_signed_bits() {
             assert_eq!(c.pc, XIP + if taken { 6 } else { 8 });
         }
     }
-    for h in [0xed02, 0xed82, 0xed11, 0xed91, 0xee11, 0xee91] {
-        let mut c = cpu(&[h, if h & 0x10 == 0 { 0x182a } else { 0x0280 }]);
+    // NaN: the ordered ED02 branch falls through and its negation is taken.
+    for (h, taken) in [(0xed02, false), (0xed82, true)] {
+        let mut c = cpu(&[h, 0x182a]);
+        c.r[1] = 0x7fc00000;
+        c.step().unwrap();
+        assert_eq!(c.pc, XIP + if taken { 88 } else { 4 });
+    }
+    // Float conditional blocks still reject NaN until their form is verified.
+    for h in [0xed11, 0xed91, 0xee11, 0xee91] {
+        let mut c = cpu(&[h, 0x0280]);
         c.r[1] = 0x7fc00000;
         assert!(c.step().is_err());
     }
