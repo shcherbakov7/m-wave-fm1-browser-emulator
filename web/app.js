@@ -1,122 +1,40 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Page controller: device panel, input, firmware loading, audio and status.
-
-// Panel geometry in the 1120×660 design space (from the upstream panel layout).
-const W = 1120, H = 660;
-const KNOBS = [
-  [91, 106, "MASTER"], [208, 106, "SELECT"], [91, 224, "PRESETS"], [208, 224, "ALGORITHM"],
-  [632, 106, "KNOB1"], [758, 106, "KNOB2"], [884, 106, "KNOB3"], [1010, 106, "KNOB4"],
-];
-const FUNCTION_LABELS = ["FX", "SEL", "ENV", "LFO", "EDIT", "GLO", "HOME", "SAVE", "ARP", "SEQ", "PLAY\nSTOP", "REC"];
-const BLACK_LABELS = ["OP1", "OP2", "OP3", "OP4", "OP5", "OP6", "PIT", "GLO", "MONO", "POLY", ""];
-const BLACK_NOTES = new Set([1, 3, 5, 8, 10, 13, 15, 17, 20, 22, 25]);
-const HOME_ID = 8;
+import { createPanel, ID } from "./panel.js";
 
 // Computer keyboard → panel control id. The 27-key keyboard starts on F.
 const KEYBOARD = new Map();
-const note = (index) => 14 + index;
-// Lower whites Z…/ (notes 0–16) and blacks S D F H J L ;
+const note = (index) => ID.NOTE + index;
+// Lower row Z…/ and the upper row S D F H J L ; (notes 0–16)
 [..."zxcvbnm,./"].forEach((k, i) => KEYBOARD.set(k, note([0, 2, 4, 6, 7, 9, 11, 12, 14, 16][i])));
 [..."sdfhjl;"].forEach((k, i) => KEYBOARD.set(k, note([1, 3, 5, 8, 10, 13, 15][i])));
-// Upper: 1 = note 17, whites Q…Y, blacks 3 4 6
+// Upper half: 1 = note 17, Q…Y, 3 4 6
 KEYBOARD.set("1", note(17));
 [..."qwerty"].forEach((k, i) => KEYBOARD.set(k, note([18, 19, 21, 23, 24, 26][i])));
 [..."346"].forEach((k, i) => KEYBOARD.set(k, note([20, 22, 25][i])));
-KEYBOARD.set("arrowleft", 0);
-KEYBOARD.set("arrowright", 1);
-KEYBOARD.set("escape", HOME_ID);
+KEYBOARD.set("arrowleft", ID.OCT_DOWN);
+KEYBOARD.set("arrowright", ID.OCT_UP);
+KEYBOARD.set("escape", ID.HOME);
+KEYBOARD.set(" ", ID.PLAY);
+const KEY_NAMES = { arrowleft: "←", arrowright: "→", escape: "Esc", " ": "Пробел" };
+const keyHints = new Map([...KEYBOARD].map(([key, id]) => [id, KEY_NAMES[key] ?? key.toUpperCase()]));
 
 const $ = (id) => document.getElementById(id);
 const device = $("device");
 const lcd = $("lcd").getContext("2d");
 const lcdImage = lcd.createImageData(240, 240);
-const controls = new Map(); // id -> element
-const held = new Map();     // id -> set of sources holding it
 
-function place(element, x, y, w, h) {
-  Object.assign(element.style, {
-    left: `${(x / W) * 100}%`, top: `${(y / H) * 100}%`,
-    width: `${(w / W) * 100}%`, height: `${(h / H) * 100}%`,
-  });
-  device.append(element);
-  return element;
-}
-
-function buildPanel() {
-  for (const [x, y, name] of KNOBS) {
-    const knob = document.createElement("div");
-    knob.className = "knob";
-    knob.title = `${name}: ручки пока не эмулируются`;
-    knob.innerHTML = `<span>${name}</span><div class="cap"></div>`;
-    place(knob, x - 30, y - 62, 60, 92);
-  }
-  place(Object.assign(document.createElement("div"), { className: "well" }), 65, 286, 181, 56);
-  ["OCT−", "OCT+"].forEach((label, id) => control(id, label, [75 + id * 82, 296, 70, 35]));
-  place(Object.assign(document.createElement("div"), { className: "well" }), 598, 186, 448, 157);
-  FUNCTION_LABELS.forEach((label, index) =>
-    control(index + 2, label, [615 + (index % 6) * 71, 201 + Math.floor(index / 6) * 70, 57, 55]));
-  const keys = place(Object.assign(document.createElement("div"), { className: "well" }), 40, 384, 1040, 238);
-  keys.style.borderRadius = "40px";
-  let white = 0, black = 0;
-  for (let n = 0; n < 27; n++) {
-    if (BLACK_NOTES.has(n)) {
-      const label = BLACK_LABELS[black++];
-      control(note(n), label, [58 + (white - 0.5) * 62.5, 405, 49, 94], "note");
-    } else {
-      control(note(n), "", [58 + white++ * 62.5, 510, 49, 94], "note white");
-    }
-  }
-}
-
-function control(id, label, [x, y, w, h], kind = "") {
-  const button = document.createElement("button");
-  button.className = `ctl ${kind}`;
-  button.type = "button";
-  button.dataset.id = id;
-  if (kind.startsWith("note")) {
-    if (label) button.innerHTML = `<small>${label}</small>`;
-    button.setAttribute("aria-label", `Нота ${id - 13}${label ? ` (${label})` : ""}`);
-  } else {
-    button.textContent = label;
-  }
-  controls.set(id, place(button, x, y, w, h));
-}
-
-function press(id, source, down) {
-  const sources = held.get(id) ?? new Set();
-  const before = sources.size > 0;
-  if (down) sources.add(source); else sources.delete(source);
-  held.set(id, sources);
-  const after = sources.size > 0;
-  if (before === after) return;
-  controls.get(id)?.classList.toggle("down", after);
-  worker.postMessage({ type: "key", id, down: after });
-}
-
-function releaseAll() {
-  for (const [id, sources] of held) {
-    if (sources.size) { sources.clear(); controls.get(id)?.classList.remove("down"); worker.postMessage({ type: "key", id, down: false }); }
-  }
-}
-
-// Pointer input: each pointer holds the control it went down on.
-device.addEventListener("pointerdown", (event) => {
-  const target = event.target.closest(".ctl");
-  if (!target) return;
-  event.preventDefault();
-  target.setPointerCapture(event.pointerId);
-  press(Number(target.dataset.id), `p${event.pointerId}`, true);
+const panel = createPanel(device, {
+  keyHints,
+  onControl: (id, down) => worker.postMessage({ type: "key", id, down }),
+  onEncoder: (index, steps) => worker.postMessage({ type: "encoder", index, steps }),
+  onMaster: (value) => worker.postMessage({ type: "master", value }),
 });
-const pointerUp = (event) => {
-  const target = event.target.closest?.(".ctl");
-  if (target) press(Number(target.dataset.id), `p${event.pointerId}`, false);
-};
-device.addEventListener("pointerup", pointerUp);
-device.addEventListener("pointercancel", pointerUp);
-device.addEventListener("contextmenu", (event) => event.preventDefault());
+const press = panel.press;
+const releaseAll = panel.releaseAll;
 
 addEventListener("keydown", (event) => {
-  if (event.target.closest("input, select, textarea") || event.metaKey || event.ctrlKey || event.altKey) return;
+  if (event.target.closest?.("input, select, textarea, .knob") || event.metaKey || event.ctrlKey || event.altKey) return;
   const id = KEYBOARD.get(event.key.toLowerCase());
   if (id === undefined) return;
   event.preventDefault();
@@ -146,6 +64,7 @@ worker.onmessage = ({ data }) => {
       lcdImage.data.set(data.frame);
       lcd.putImageData(lcdImage, 0, 0);
       break;
+    case "leds": panel.setLeds(data.leds); break;
     case "serial": appendSerial(data.text); break;
     case "serial-busy": appendSerial("\n[консоль занята, повторите]\n"); break;
     case "status": showStatus(data.info); break;
@@ -276,4 +195,3 @@ async function restoreLast() {
   setState("Загрузите прошивку FM-1 (.fwsc), например официальную V15 или Felucca");
 }
 
-buildPanel();

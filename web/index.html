@@ -24,7 +24,7 @@
 
   <main>
     <section id="device" class="device" aria-label="Панель FM-1">
-      <div class="screen-bezel"><canvas id="lcd" width="240" height="240" aria-label="Экран"></canvas>
+      <div id="lcd-frame" class="lcd-frame"><canvas id="lcd" width="240" height="240" aria-label="Экран"></canvas>
         <div id="drop-hint" class="drop-hint">Перетащите сюда файл прошивки<br><small>.fwsc · .ufw · .bin · .elf</small></div>
       </div>
     </section>
@@ -39,13 +39,14 @@
       </dl>
       <details class="help" open>
         <summary>Управление</summary>
-        <p>Мышь или касание: кнопки и клавиши (удерживайте). Клавиатура:</p>
+        <p>Кнопки и клавиши — мышью или касанием (удерживайте; по клавишам можно вести пальцем). Ручки — тяните вверх/вниз, крутите колёсико мыши или стрелками, наведя фокус. MASTER — громкость, остальные семь ручек — энкодеры.</p>
+        <p>Клавиатура компьютера:</p>
         <ul>
-          <li><kbd>Z</kbd>…<kbd>/</kbd> и <kbd>S</kbd> <kbd>D</kbd> <kbd>F</kbd> <kbd>H</kbd> <kbd>J</kbd> <kbd>L</kbd> <kbd>;</kbd> — нижняя часть клавиатуры</li>
+          <li><kbd>Z</kbd>…<kbd>/</kbd> и <kbd>S</kbd> <kbd>D</kbd> <kbd>F</kbd> <kbd>H</kbd> <kbd>J</kbd> <kbd>L</kbd> <kbd>;</kbd> — клавиши с F3</li>
           <li><kbd>1</kbd> <kbd>Q</kbd>…<kbd>Y</kbd> и <kbd>3</kbd> <kbd>4</kbd> <kbd>6</kbd> — верхняя часть</li>
-          <li><kbd>←</kbd> <kbd>→</kbd> — OCT− / OCT+, <kbd>Esc</kbd> — HOME</li>
+          <li><kbd>←</kbd> <kbd>→</kbd> — OCT− / OCT+, <kbd>Esc</kbd> — HOME, <kbd>Пробел</kbd> — PLAY/STOP</li>
         </ul>
-        <p class="note">Ручки пока не эмулируются. Эмуляция работает медленнее реального устройства, поэтому звук прерывистый.</p>
+        <p class="note">Подсветка кнопок и клавиш повторяет светодиоды устройства.</p>
       </details>
       <details class="console">
         <summary>USB-консоль прошивки</summary>

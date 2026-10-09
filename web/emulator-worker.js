@@ -23,6 +23,7 @@ let audioPtr = 0;
 let serialPtr = 0;
 let audioPort = null;         // MessagePort to the audio worklet
 let timer = 0;
+let lastLeds = null;         // LED levels last sent
 
 const mem = () => new Uint8Array(x.memory.buffer);
 const message = () => {
@@ -76,6 +77,13 @@ function flushOutputs(now) {
       postMessage({ type: "lcd", frame }, [frame.buffer]);
     }
     lastFrame = now;
+    // LEDs, measured over the frame; sent when they change.
+    const ledPtr = x.fm1_leds();
+    const leds = mem().slice(ledPtr, ledPtr + 41);
+    if (!lastLeds || leds.some((v, i) => Math.abs(v - lastLeds[i]) > 2)) {
+      lastLeds = leds;
+      postMessage({ type: "leds", leds: leds.slice() });
+    }
   }
   for (;;) {
     const frames = x.fm1_audio(audioPtr, AUDIO_CHUNK);
@@ -152,6 +160,8 @@ onmessage =({ data }) => {
     case "init": init(data.wasmUrl).catch((error) => postMessage({ type: "error", message: String(error) })); break;
     case "load": load(data.bytes, data.name); break;
     case "key": if (x) x.fm1_key(data.id, data.down ? 1 : 0); break;
+    case "encoder": if (x) x.fm1_encoder(data.index, data.steps); break;
+    case "master": if (x) x.fm1_master(data.value); break;
     case "audio-port": audioPort = data.port; break;
     case "pause":
       paused = data.paused;

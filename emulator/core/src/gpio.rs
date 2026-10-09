@@ -20,6 +20,24 @@ pub const PANEL_KEYMAP: [[i8; 11]; 4] = [
 ];
 pub const PANEL_CONTROLS: usize = 41;
 
+/// The rotary encoders SELECT, PRESETS, ALGORITHM and KNOB 1-4: matrix
+/// `(column, row)` contacts of phases A and B. A clockwise detent closes B,
+/// then A, then opens B, then A (00, 01, 11, 10, 00 as AB); each phase must
+/// last over a firmware matrix scan. From the Felucca FM1_ENC table and the
+/// upstream panel. MASTER is a potentiometer on SARADC channel 4 instead.
+pub const PANEL_ENCODERS: [((usize, usize), (usize, usize)); 7] = [
+    ((0, 0), (1, 0)),
+    ((2, 0), (3, 0)),
+    ((0, 5), (1, 5)),
+    ((8, 1), (9, 1)),
+    ((8, 0), (9, 0)),
+    ((6, 0), (7, 0)),
+    ((4, 0), (5, 0)),
+];
+
+/// GPIO port H, which drives two of the four LED lines.
+const PORT_H: usize = 7;
+
 /// Matrix `(column, row)` contact for a panel control ID.
 pub fn panel_contact(id: usize) -> Option<(usize, usize)> {
     PANEL_KEYMAP.iter().enumerate().find_map(|(row, ids)| {
@@ -82,6 +100,19 @@ impl Gpio {
                     rows
                 }
             })
+    }
+
+    /// Matrix columns the 74HC595 selects now (bit per column, active low).
+    pub fn selected_columns(&self) -> u16 {
+        !self.latched & ((1 << 11) - 1)
+    }
+
+    /// LED lines driven high, as matrix row bits: a lit LED sits at a
+    /// selected column on row 1 (PA9), 2 (PA10), 3 (PH6) or 4 (PH9).
+    pub fn led_rows(&self) -> u8 {
+        let driven = |port: usize| self.ports[port][OUT as usize / 4] & !self.ports[port][DIR as usize / 4];
+        let (a, h) = (driven(0), driven(PORT_H));
+        ((a >> 9 & 1) << 1 | (a >> 10 & 1) << 2 | (h >> 6 & 1) << 3 | (h >> 9 & 1) << 4) as u8
     }
 
     fn input(&self, port: usize) -> u32 {

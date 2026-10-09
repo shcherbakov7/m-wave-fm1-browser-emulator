@@ -6,12 +6,9 @@
   --accent: #e7c15b;
   --danger: #ff7a70;
   --ok: #7bd88f;
-  --body: #2c2e31;
-  --body-edge: #55585c;
-  --key: #26282b;
-  --key-edge: #56595d;
-  --key-down: #4b412a;
-  --ink: #bec2c1;
+  --shell-top: #5e6164;
+  --shell-bottom: #4b4e51;
+  --print: #b8bcbf;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -43,60 +40,131 @@ main {
 }
 @media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
 
-/* Device panel: children are positioned in a 1120×660 design space. */
+/* Device panel: children are placed in a 1288×740 design space (panel.js);
+   sizes in cqw scale with the panel's width. */
 .device {
-  position: relative; width: 100%; aspect-ratio: 1120 / 660;
-  background: var(--body); border: 2px solid var(--body-edge); border-radius: 5.8% / 9.8%;
-  box-shadow: 0 14px 40px #0008, inset 0 0 0 6px #1d1f22;
+  position: relative; width: 100%; aspect-ratio: 1288 / 740; container-type: inline-size;
+  border-radius: 2.6% / 4.5%;
+  background:
+    radial-gradient(120% 90% at 30% 0%, #ffffff12, transparent 60%),
+    linear-gradient(180deg, var(--shell-top), var(--shell-bottom));
+  box-shadow:
+    0 2.2cqw 4cqw #000a, 0 .3cqw .5cqw #0008,
+    inset 0 .15cqw 0 #ffffff26, inset 0 -.3cqw .6cqw #0006;
   user-select: none; -webkit-user-select: none; touch-action: none;
 }
 .device.dragging { outline: 3px dashed var(--accent); outline-offset: 6px; }
 .device > * { position: absolute; }
-.screen-bezel {
-  left: 25.9%; top: 7.9%; width: 24.1%; height: 41.2%;
-  background: #080808; border-radius: 12%; padding: 1.8%;
+.well {
+  background: linear-gradient(180deg, #1d1e20, #2a2b2e);
+  border-radius: 1.6cqw;
+  box-shadow: inset 0 .25cqw .6cqw #000c, 0 .1cqw 0 #ffffff1c;
 }
-#lcd {
-  width: 100%; height: 100%; display: block; background: #000; border-radius: 2px;
-  image-rendering: pixelated;
+.keys-well { border-radius: 3.6cqw; background: linear-gradient(180deg, #2b2526, #352e2e); }
+.bezel {
+  background: linear-gradient(160deg, #111214, #050506);
+  border-radius: 2.8cqw;
+  box-shadow: inset 0 0 0 .15cqw #2b2d31, inset 0 .3cqw .8cqw #000, 0 .12cqw 0 #ffffff1a;
 }
+.lcd-frame {
+  position: absolute; left: 12.34%; top: 10.78%; width: 75.95%; height: 78.43%;
+  background: #000; box-shadow: 0 0 0 .2cqw #000, 0 0 1.2cqw #000;
+}
+#lcd { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
 .drop-hint {
   position: absolute; inset: 8%; display: flex; flex-direction: column; justify-content: center;
-  text-align: center; color: var(--muted); font-size: clamp(10px, 1.2vw, 15px); pointer-events: none;
+  text-align: center; color: var(--muted); font-size: 1.5cqw; pointer-events: none;
 }
 .drop-hint.hidden { display: none; }
+.print {
+  display: flex; align-items: center; justify-content: center;
+  color: var(--print); font: 700 1.55cqw/1 "Arial Narrow", "Roboto Condensed", system-ui, sans-serif;
+  letter-spacing: .12cqw; pointer-events: none; text-shadow: 0 .08cqw 0 #0006;
+}
+.dot { border-radius: 50%; background: #0b0a0a; box-shadow: 0 .05cqw 0 #ffffff1f; }
+
+/* Knobs: a knurled skirt, a cap that turns, and its marker. */
 .knob {
-  display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
-  color: var(--ink); font-size: clamp(7px, 1vw, 13px); letter-spacing: .4px;
+  border-radius: 50%; cursor: grab; outline: none;
+  background: radial-gradient(circle, #0d0e0f 0 64%, #000 66% 100%);
+  box-shadow: 0 .5cqw .8cqw #000b, 0 .1cqw .1cqw #000;
 }
+.knob.turning { cursor: grabbing; }
+.knob:focus-visible { box-shadow: 0 0 0 .3cqw var(--accent), 0 .5cqw .8cqw #000b; }
 .knob .cap {
-  width: 100%; aspect-ratio: 1; border-radius: 50%;
-  background: radial-gradient(circle at 50% 50%, #23252a 0 62%, #8a8a8a 63% 66%, #121314 67% 74%, #424446 75% 100%);
-  box-shadow: 2px 4px 0 #0c0c0d; position: relative;
+  position: absolute; inset: 6%; border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 50%, #6b6d70 0 52%, transparent 53%),
+    radial-gradient(circle at 38% 30%, #9a9ca0, #4d4f52 60%, #2c2d2f),
+    repeating-conic-gradient(#1b1c1d 0 6deg, #4c4e51 6deg 12deg);
+  box-shadow: inset 0 .15cqw .2cqw #ffffff40, inset 0 -.2cqw .3cqw #0009;
+  transition: transform 60ms linear;
 }
-.knob .cap::after {
-  content: ""; position: absolute; left: 38%; top: 12%; width: 6%; height: 18%;
-  background: var(--ink); border-radius: 2px; transform: rotate(-25deg);
+.knob .cap::before {
+  content: ""; position: absolute; inset: 22%; border-radius: 50%;
+  background: radial-gradient(circle at 40% 32%, #8c8e92, #55575a 55%, #3d3f42);
+  box-shadow: 0 .05cqw .15cqw #0008;
 }
-.knob span { margin-bottom: 6%; white-space: nowrap; }
-.well { background: #111214; border-radius: 14px; }
+.knob .mark {
+  position: absolute; left: 46%; top: 10%; width: 8%; height: 22%; border-radius: 1cqw;
+  background: #f1f1ee; box-shadow: 0 0 .2cqw #fff6;
+}
+
+/* Buttons and key pads; --led (0..1) is the LED under them. */
 .ctl {
-  display: flex; align-items: center; justify-content: center; text-align: center;
-  background: var(--key); color: var(--ink); border: 1px solid var(--key-edge);
-  border-radius: 8px; box-shadow: 0 3px 0 #000; cursor: pointer;
-  font: 600 clamp(6px, 0.95vw, 12px)/1.1 system-ui, sans-serif; white-space: pre-line; padding: 0;
+  --led: 0; --led-rgb: 255 246 222;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 0; border: 0; cursor: pointer; color: var(--print);
+  font: 700 1.25cqw/1.05 "Arial Narrow", "Roboto Condensed", system-ui, sans-serif;
+  letter-spacing: .06cqw; white-space: pre-line; text-align: center;
+  transition: transform 40ms, box-shadow 40ms, filter 40ms;
 }
-.ctl:hover { background: #303237; }
-.ctl.down { background: var(--key-down); color: var(--accent); transform: translateY(1px); box-shadow: 0 2px 0 #000; }
-.ctl.note {
-  border-radius: 22px / 18px; flex-direction: column; justify-content: center; gap: 8%;
+.ctl[data-led="green"] { --led-rgb: 120 255 140; }
+.ctl[data-led="red"] { --led-rgb: 255 90 80; }
+.ctl::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: radial-gradient(closest-side, rgb(var(--led-rgb) / .55), rgb(var(--led-rgb) / .12) 75%, transparent);
+  opacity: var(--led); mix-blend-mode: screen;
 }
-.ctl.note::before {
-  content: ""; width: 12%; height: 32%; border-radius: 3px; background: var(--ink);
+.ctl .legend { position: relative; z-index: 1; pointer-events: none; }
+.btn {
+  border-radius: 1cqw;
+  background: linear-gradient(180deg, #50565a, #3c4144);
+  box-shadow: 0 .45cqw 0 #1b1d1f, 0 .55cqw .8cqw #000a, inset 0 .1cqw 0 #ffffff2e;
+  text-shadow: 0 0 calc(var(--led) * 1cqw) rgb(var(--led-rgb) / .9);
 }
-.ctl.note.down::before { background: var(--accent); }
-.ctl.note small { font-size: clamp(5px, .8vw, 11px); font-weight: 500; }
-.ctl.note.white::before { height: 34%; }
+.btn .legend { color: color-mix(in srgb, var(--print), rgb(var(--led-rgb)) calc(var(--led) * 100%)); }
+.btn.oct { border-radius: .8cqw; font-size: 1.15cqw; }
+.ctl:hover { filter: brightness(1.12); }
+.btn.down {
+  transform: translateY(.35cqw);
+  box-shadow: 0 .1cqw 0 #1b1d1f, 0 .2cqw .3cqw #000a, inset 0 .1cqw 0 #ffffff1a;
+}
+.pad {
+  border-radius: 999px;
+  background: linear-gradient(180deg, #685a58, #574b49);
+  box-shadow:
+    0 0 0 .22cqw #2a2324, 0 .45cqw .2cqw #120e0e, 0 .6cqw .8cqw #000a,
+    inset 0 .15cqw .1cqw #ffffff22, inset 0 -.3cqw .4cqw #0005;
+  justify-content: flex-start; padding-top: 1.7cqw;
+  gap: .9cqw;
+}
+.pad .groove {
+  width: .5cqw; height: 3.4cqw; border-radius: 1cqw; flex: none;
+  background: linear-gradient(90deg, #4a3f3e, #9b8f8c 50%, #4a3f3e);
+  box-shadow: inset 0 .1cqw .15cqw #0006;
+  position: relative; z-index: 1;
+}
+.pad.upper .groove { height: 3cqw; }
+.pad:not(.upper) { padding-top: 2.6cqw; }
+.pad .legend { font-size: .95cqw; font-weight: 600; opacity: .7; }
+.pad.down {
+  transform: translateY(.3cqw);
+  background: linear-gradient(180deg, #5f5250, #504543);
+  box-shadow:
+    0 0 0 .22cqw #2a2324, 0 .15cqw .1cqw #120e0e, 0 .25cqw .4cqw #000a,
+    inset 0 .3cqw .5cqw #0006;
+}
 
 .info { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .state {

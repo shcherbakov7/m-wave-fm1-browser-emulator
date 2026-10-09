@@ -5,7 +5,7 @@
 use fm1_emu::{
     cpu::Cpu,
     firmware::Firmware,
-    gpio::{panel_contact, PANEL_CONTROLS},
+    gpio::{panel_contact, PANEL_CONTROLS, PANEL_ENCODERS},
 };
 use std::cell::RefCell;
 
@@ -19,6 +19,19 @@ const OSCILLATOR_HZ: f64 = 24e6;
 /// scanning and debounce however slowly the emulator runs.
 const MIN_PRESS_TICKS: u64 = 2_400_000;
 const LCD_PIXELS: usize = 240 * 240;
+/// Guest time each quadrature phase of a turning encoder lasts (4 ms):
+/// longer than any firmware's matrix scan, about 60 detents a second.
+const ENCODER_PHASE_TICKS: u64 = 96_000;
+
+/// A turning encoder: detents still to play, the current one's direction,
+/// its phase (0 = at rest) and when the next phase starts.
+#[derive(Clone, Copy, Default)]
+struct Encoder {
+    pending: i32,
+    direction: i32,
+    phase: u8,
+    next: u64,
+}
 
 struct Machine {
     cpu: Option<Cpu>,
@@ -29,6 +42,14 @@ struct Machine {
     held: [bool; PANEL_CONTROLS],
     release_after: [u64; PANEL_CONTROLS],
     closed: [bool; PANEL_CONTROLS],
+    encoders: [Encoder; PANEL_ENCODERS.len()],
+    /// MASTER potentiometer, 0..=1023 (kept across firmware loads).
+    master: u16,
+    /// LED samples: per control, how often it was lit; per matrix column,
+    /// how often it was selected; and the brightness last reported.
+    led_lit: [u32; PANEL_CONTROLS],
+    led_column: [u32; 11],
+    leds: [u8; PANEL_CONTROLS],
     #[cfg(target_arch = "wasm32")]
     jit: jit::Jit,
 }
@@ -44,6 +65,11 @@ impl Machine {
             held: [false; PANEL_CONTROLS],
             release_after: [0; PANEL_CONTROLS],
             closed: [false; PANEL_CONTROLS],
+            encoders: [Encoder::default(); PANEL_ENCODERS.len()],
+            master: 512,
+            led_lit: [0; PANEL_CONTROLS],
+            led_column: [0; 11],
+            leds: [0; PANEL_CONTROLS],
             #[cfg(target_arch = "wasm32")]
             jit: jit::Jit::new(),
         }
@@ -68,16 +94,20 @@ impl Machine {
             self.jit.verify = previous.jit.verify;
             self.jit.chaining = previous.jit.chaining;
         }
+        self.master = previous.master;
+        cpu.bus.devices.adc.master = self.master;
         drop(previous);
         self.cpu = Some(cpu);
         Ok(())
     }
 
-    /// Apply held/minimum-duration key state to the guest matrix.
+    /// Apply held/minimum-duration key state and encoder phases to the
+    /// guest matrix, and sample the LEDs.
     fn sync_keys(&mut self) {
         let Some(cpu) = &mut self.cpu else { return };
+        let now = cpu.bus.oscillator_ticks;
         for id in 0..PANEL_CONTROLS {
-            let closed = self.held[id] || cpu.bus.oscillator_ticks < self.release_after[id];
+            let closed = self.held[id] || now < self.release_after[id];
             if closed != self.closed[id] {
                 if let Some((column, row)) = panel_contact(id) {
                     let _ = cpu.bus.devices.gpio.press(column, row, closed);
@@ -85,6 +115,60 @@ impl Machine {
                 self.closed[id] = closed;
             }
         }
+        for (encoder, &(a, b)) in self.encoders.iter_mut().zip(&PANEL_ENCODERS) {
+            if now < encoder.next || (encoder.pending == 0 && encoder.phase == 0) {
+                continue;
+            }
+            if encoder.phase == 0 {
+                encoder.direction = encoder.pending.signum();
+                encoder.pending -= encoder.direction;
+            }
+            // Clockwise: B closes first, then A; B opens first, then A.
+            let (first, second) = if encoder.direction > 0 { (b, a) } else { (a, b) };
+            let (contact, closed) = match encoder.phase {
+                0 => (first, true),
+                1 => (second, true),
+                2 => (first, false),
+                _ => (second, false),
+            };
+            let _ = cpu.bus.devices.gpio.press(contact.0, contact.1, closed);
+            encoder.phase = (encoder.phase + 1) % 4;
+            encoder.next = now + ENCODER_PHASE_TICKS;
+        }
+        // LEDs: lit while their column is selected and their line is high.
+        let gpio = &cpu.bus.devices.gpio;
+        let (columns, rows) = (gpio.selected_columns(), gpio.led_rows());
+        if columns != 0 {
+            for column in 0..11 {
+                if columns & (1 << column) != 0 {
+                    self.led_column[column] += 1;
+                }
+            }
+            if rows != 0 {
+                for id in 0..PANEL_CONTROLS {
+                    if let Some((column, row)) = panel_contact(id) {
+                        if columns & (1 << column) != 0 && rows & (1 << row) != 0 {
+                            self.led_lit[id] += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// LED brightness (0..=255) per control since the previous call; a
+    /// column not seen since keeps its LEDs as they were.
+    fn take_leds(&mut self) -> &[u8; PANEL_CONTROLS] {
+        for id in 0..PANEL_CONTROLS {
+            let Some((column, _)) = panel_contact(id) else { continue };
+            let seen = self.led_column[column];
+            if seen != 0 {
+                self.leds[id] = (self.led_lit[id].min(seen) * 255 / seen) as u8;
+            }
+            self.led_lit[id] = 0;
+        }
+        self.led_column = [0; 11];
+        &self.leds
     }
 
     fn run(&mut self, steps: u32) -> i32 {
@@ -227,6 +311,35 @@ pub extern "C" fn fm1_guest_seconds() -> f64 {
 #[no_mangle]
 pub extern "C" fn fm1_steps() -> f64 {
     with(|m| m.cpu.as_ref().map_or(0.0, |cpu| cpu.steps as f64))
+}
+
+/// Turn rotary encoder `index` (SELECT, PRESETS, ALGORITHM, KNOB 1-4) by
+/// `steps` detents, positive clockwise. The detents play out over guest time.
+#[no_mangle]
+pub extern "C" fn fm1_encoder(index: u32, steps: i32) {
+    with(|m| {
+        if let Some(encoder) = m.encoders.get_mut(index as usize) {
+            encoder.pending = (encoder.pending + steps).clamp(-32, 32);
+        }
+    })
+}
+
+/// Set the MASTER potentiometer (0..=1023).
+#[no_mangle]
+pub extern "C" fn fm1_master(value: u32) {
+    with(|m| {
+        m.master = value.min(1023) as u16;
+        if let Some(cpu) = &mut m.cpu {
+            cpu.bus.devices.adc.master = m.master;
+        }
+    })
+}
+
+/// Pointer to the LED brightness of the 41 panel controls (bytes, 0..=255,
+/// by control ID), measured since the previous call.
+#[no_mangle]
+pub extern "C" fn fm1_leds() -> *const u8 {
+    with(|m| m.take_leds().as_ptr())
 }
 
 /// Press (1) or release (0) a panel control (see `PANEL_KEYMAP`).

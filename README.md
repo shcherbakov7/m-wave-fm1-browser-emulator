@@ -6,6 +6,8 @@
 периферию платы: экран 240×240, клавиатуру из 27 клавиш и 14 кнопок, аудио,
 USB, флеш-память. Ядро написано на Rust и собирается в WebAssembly.
 
+![Панель эмулятора с Felucca](docs/panel.png)
+
 ![Восемь прошивок в эмуляторе](docs/compatibility.png)
 
 ## Совместимость
@@ -33,9 +35,14 @@ Jangada, ChoralRoot, FiMba и другие. Если прошивка остан
    Прошивки не входят в комплект. Официальную можно скачать на
    [m-vave.com](https://www.m-vave.com/download), сторонние — на страницах
    их авторов ([FM-1 Firmware Hub](https://fm1.designburgapps.com/)).
-3. Кнопки и клавиши нажимаются мышью или касанием. Клавиатура компьютера:
-   `Z`…`/` и `S D F H J L ;` — нижняя часть клавиатуры, `1 Q…Y 3 4 6` —
-   верхняя, `←`/`→` — OCT−/OCT+, `Esc` — HOME.
+3. Панель повторяет FM-1: все 14 кнопок, 27 клавиш и 8 ручек работают.
+   Кнопки и клавиши нажимаются мышью или касанием (по клавишам можно вести
+   пальцем). Ручки крутятся перетаскиванием вверх/вниз, колёсиком мыши или
+   стрелками после Tab. MASTER — громкость (потенциометр), SELECT, PRESETS,
+   ALGORITHM и KNOB 1–4 — энкодеры, как в устройстве. Подсветка кнопок и
+   клавиш повторяет светодиоды. Клавиатура компьютера: `Z`…`/` и
+   `S D F H J L ;` — клавиши с F3, `1 Q…Y 3 4 6` — верхняя часть, `←`/`→` —
+   OCT−/OCT+, `Esc` — HOME, пробел — PLAY/STOP.
 4. Кнопка **«Звук»** включает вывод звука. Загруженные прошивки запоминаются
    в браузере (список «Недавние»).
 
@@ -50,7 +57,6 @@ Jangada, ChoralRoot, FiMba и другие. Если прошивка остан
   Официальная прошивка тяжелее всех: она обслуживает матрицу кнопок и
   светодиодов прерыванием на каждые 1–2 байта SPI (десятки тысяч прерываний
   в секунду).
-- Ручки (энкодеры) пока не эмулируются.
 - USB MIDI с компьютера, Bluetooth и установка прошивки «по воздуху»
   (через эмулированный апдейтер) не поддерживаются.
 - Для неподтверждённых на железе случаев (деление на ноль во float и т.п.)
@@ -81,6 +87,9 @@ PROFILE_OPS=1 cargo run --release --manifest-path emulator/Cargo.toml --example 
 node tools/browser-smoke.mjs FIRMWARE.fwsc screenshot.png
 # WebAssembly-сборка в Node: скорость, экран, проверка JIT
 node tools/wasm-smoke.mjs web/fm1.wasm FIRMWARE.fwsc 1000000000 screen.png
+# Ручки, кнопки и светодиоды: в Node и в Chromium
+node tools/panel-check.mjs web/fm1.wasm FIRMWARE.fwsc
+node tools/browser-panel.mjs FIRMWARE.fwsc screenshot.png
 # Где прошивка проводит время, какой код генерирует JIT
 cargo run --release --manifest-path emulator/Cargo.toml --example hotspots -- FIRMWARE.fwsc
 ```
