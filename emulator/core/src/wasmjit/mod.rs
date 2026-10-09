@@ -51,6 +51,21 @@ pub struct Layout {
     /// leaves for a PC with a matching entry tail-calls that block directly
     /// (modules then import `env.table`, the host's function table).
     pub chain: Option<(u32, u32)>,
+    /// SRAM code marks (one byte per `CODE_CHUNK` bytes, see
+    /// `Bus::code_marks`): translated stores to marked SRAM take the slow
+    /// path, which drops the stale translations.
+    pub code_marks: Option<u32>,
+    /// For code translated from SRAM: the NOR generation word and its value
+    /// at translation. Inlined flash reads require it unchanged, since
+    /// such code may run while XIP is remapped or off.
+    pub xip_check: Option<(u32, u32)>,
+}
+
+/// The code area holding `pc` (XIP flash or SRAM) as `[start, end)`.
+pub fn code_region(pc: u32) -> Option<(u32, u32)> {
+    [(XIP, XIP_END), (RAM, RAM + RAM_SIZE as u32)]
+        .into_iter()
+        .find(|(start, end)| (*start..*end).contains(&pc))
 }
 
 pub struct Block {
@@ -58,6 +73,8 @@ pub struct Block {
     /// Guest instructions in the longest path through the block.
     pub instructions: u32,
     pub wasm: Vec<u8>,
+    /// Instruction bytes read for each basic block, `[start, end)`.
+    pub ranges: Vec<(u32, u32)>,
 }
 
 /// Longest straight-line run translated into one basic block.
@@ -498,6 +515,32 @@ impl Translator<'_> {
                     .op(I32_OR)
                     .op(I32_AND);
             }
+            self.unmarked(low, high);
+        }
+    }
+    /// AND onto the condition: `[ADDR + low, ADDR + high)` touches no SRAM
+    /// chunk holding translated code (when SRAM code is translated).
+    fn unmarked(&mut self, low: i32, high: i32) {
+        let Some(marks) = self.layout.code_marks else { return };
+        let chunks = RAM_SIZE as u32 / crate::bus::CODE_CHUNK;
+        let mut offsets: Vec<i32> = (low..high).step_by(crate::bus::CODE_CHUNK as usize).collect();
+        offsets.push(high - 1);
+        for offset in offsets {
+            // Masked so that it stays in bounds when ADDR is not SRAM (the
+            // range test fails then anyway).
+            self.body
+                .get(ADDR)
+                .i32(offset)
+                .op(I32_ADD)
+                .u32(RAM)
+                .op(I32_SUB)
+                .u32(crate::bus::CODE_CHUNK.trailing_zeros())
+                .op(I32_SHR_U)
+                .u32(chunks - 1)
+                .op(I32_AND)
+                .load(1, false, marks)
+                .op(I32_EQZ)
+                .op(I32_AND);
         }
     }
     /// Push the SRAM byte offset of guest address `ADDR + offset`.
@@ -587,6 +630,14 @@ impl Translator<'_> {
                     .u32(m.size as u32 - 1)
                     .op(I32_AND)
                     .op(I32_EQZ)
+                    .op(I32_AND);
+            }
+            if let Some((generation, expected)) = self.layout.xip_check {
+                self.body
+                    .i32(0)
+                    .load(4, false, generation)
+                    .u32(expected)
+                    .op(I32_EQ)
                     .op(I32_AND);
             }
             self.body
@@ -766,9 +817,7 @@ pub(crate) fn translate_limited(
     limit: u32,
     max_blocks: usize,
 ) -> Option<Block> {
-    if !(XIP..XIP_END).contains(&start) {
-        return None;
-    }
+    let (area_start, area_end) = code_region(start)?;
     // Scan: find the blocks and their static successors.
     let mut blocks = vec![start];
     let mut total = 0;
@@ -797,7 +846,7 @@ pub(crate) fn translate_limited(
         for successor in scan.successors {
             if blocks.len() < max_blocks
                 && total < MAX_REGION_INSTRUCTIONS
-                && (XIP..XIP_END).contains(&successor)
+                && (area_start..area_end).contains(&successor)
                 && !blocks.contains(&successor)
             {
                 blocks.push(successor);
@@ -808,6 +857,7 @@ pub(crate) fn translate_limited(
     // Emit: a dispatch loop over the blocks, entered at block 0.
     let index: std::collections::HashMap<u32, usize> =
         blocks.iter().enumerate().map(|(i, &pc)| (pc, i)).collect();
+    let mut ranges = Vec::new();
     let mut t = Translator::new(layout);
     // A register written on one path is stored back on every path, so it
     // must hold the CPU's value until then.
@@ -824,7 +874,9 @@ pub(crate) fn translate_limited(
     t.body.get(NEXT_BLOCK).br_table(&targets, 0).end();
     for (current, &pc) in blocks.iter().enumerate() {
         t.region = Some((&index, current, n));
+        bus.start_fetch_log();
         basic_block(&mut t, bus, decode, pc, limit)?;
+        ranges.extend(bus.fetched());
         if current + 1 < n {
             t.body.end();
         }
@@ -837,6 +889,7 @@ pub(crate) fn translate_limited(
     Some(Block {
         start,
         instructions: total,
+        ranges,
         wasm: module(&t.body, LOCALS - 1, layout.chain.is_some()),
     })
 }
@@ -876,7 +929,7 @@ fn basic_block(
         if flow == Flow::End {
             return Some(t.count);
         }
-        if t.count >= limit || !(XIP..XIP_END).contains(&pc) {
+        if t.count >= limit || code_region(pc) != code_region(start) {
             // Continue at the next instruction as a separate block.
             t.count -= 1;
             t.goto(pc);
@@ -897,8 +950,7 @@ fn instruction(
 ) -> Option<(Flow, u32)> {
     let word = |offset: u32| -> Option<u32> {
         let address = pc.wrapping_add(offset);
-        (XIP..XIP_END)
-            .contains(&address)
+        (code_region(address).is_some() && code_region(address) == code_region(pc))
             .then(|| bus.fetch(address).ok().map(u32::from))
             .flatten()
     };

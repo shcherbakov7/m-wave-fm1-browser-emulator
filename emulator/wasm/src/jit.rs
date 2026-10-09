@@ -114,7 +114,12 @@ pub struct Jit {
     chain: Vec<[u32; 2]>,
     /// Whether the host supports tail calls, which chaining needs.
     pub chaining: bool,
+    /// Flash state the XIP translations match (`translation_generation`).
     generation: u32,
+    /// SRAM code version the SRAM translations match.
+    sram_generation: u32,
+    /// XIP is off: chain entries into XIP translations are cleared.
+    xip_chain_off: bool,
     pub enabled: bool,
     /// Check every block without interpreter calls against the interpreter
     /// (the first few calls at each entry PC; slow, for diagnostics). A
@@ -158,14 +163,50 @@ impl Drop for Jit {
 impl Jit {
     /// Drop every translation and hand its function back to the host.
     fn release_all(&mut self) {
-        for (_, slot) in &self.slots {
+        self.release_where(|_| true);
+    }
+
+    /// Drop the translations of blocks starting at PCs matching `stale`.
+    fn release_where(&mut self, stale: impl Fn(u32) -> bool) {
+        for (index, (pc, slot)) in self.slots.iter_mut().enumerate() {
+            if *pc == u32::MAX || !stale(*pc) {
+                continue;
+            }
             if let Slot::Ready(function) = slot {
                 // SAFETY: host import; nothing calls the index any more.
                 unsafe { jit_release(*function as usize as i32) };
             }
+            *pc = u32::MAX;
+            *slot = Slot::Unavailable;
+            self.chain[index] = [u32::MAX, 0];
         }
-        self.slots.fill((u32::MAX, Slot::Unavailable));
-        self.chain.fill([u32::MAX, 0]);
+    }
+
+    /// Drop translations that the code in flash or SRAM no longer matches.
+    /// While XIP is off its translations are kept for when the same
+    /// mapping returns, but nothing chains into them meanwhile.
+    fn validate(&mut self, cpu: &Cpu) {
+        let xip = |pc: u32| (fm1_emu::XIP..fm1_emu::XIP_END).contains(&pc);
+        let sram = cpu.bus.sram_code_generation();
+        if sram != self.sram_generation {
+            self.release_where(|pc| !xip(pc));
+            self.sram_generation = sram;
+        }
+        let generation = cpu.bus.translation_generation();
+        if generation == self.generation {
+            self.xip_chain_off = false;
+        } else if cpu.bus.xip_active() {
+            self.release_where(xip);
+            self.generation = generation;
+            self.xip_chain_off = false;
+        } else if !self.xip_chain_off {
+            for (index, (pc, _)) in self.slots.iter().enumerate() {
+                if xip(*pc) {
+                    self.chain[index] = [u32::MAX, 0];
+                }
+            }
+            self.xip_chain_off = true;
+        }
     }
 
     pub fn new() -> Self {
@@ -174,6 +215,8 @@ impl Jit {
             chain: vec![[u32::MAX, 0]; SLOTS],
             chaining: false,
             generation: u32::MAX,
+            sram_generation: u32::MAX,
+            xip_chain_off: false,
             enabled: true,
             verify: false,
             verified: 0,
@@ -183,16 +226,10 @@ impl Jit {
     }
 
     fn block(&mut self, cpu: &mut Cpu, pc: u32) -> Option<extern "C" fn(u32) -> u32> {
-        let generation = cpu.bus.translation_generation();
-        if generation != self.generation {
-            if !cpu.bus.xip_active() {
-                // Nothing runs from flash now; keep the translations for
-                // when the same mapping returns.
-                return None;
-            }
-            // Flash or its mapping changed: every translation may be stale.
-            self.release_all();
-            self.generation = generation;
+        self.validate(cpu);
+        let xip = (fm1_emu::XIP..fm1_emu::XIP_END).contains(&pc);
+        if xip && self.xip_chain_off {
+            return None; // XIP is off: let the interpreter fault
         }
         let index = (pc >> 1) as usize & (SLOTS - 1);
         let entry = &mut self.slots[index];
@@ -206,7 +243,11 @@ impl Jit {
             *entry = (pc, Slot::Counting(0));
         }
         match &mut entry.1 {
-            Slot::Ready(function) => return Some(*function),
+            Slot::Ready(function) => {
+                // Its chain entry may have been cleared while XIP was off.
+                self.chain[index] = [pc, *function as usize as u32];
+                return Some(*function);
+            }
             Slot::Unavailable => return None,
             Slot::Counting(count) if *count < HOT => {
                 *count += 1;

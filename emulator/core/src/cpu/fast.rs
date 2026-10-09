@@ -85,6 +85,8 @@ impl Cpu {
                 }
             } else if self.dual_ready() && self.dual_batch(max, blocks)? != 0 {
                 continue;
+            } else if self.secondary_ready() && self.secondary_batch(max, blocks)? != 0 {
+                continue;
             }
             let op = self.step()?;
             if let Some(ops) = &mut self.unbatched_ops {
@@ -131,6 +133,45 @@ impl Cpu {
             && !core.bus_locked
             && self.idle_wake_delay == 0
             && core.idle_wake_delay == 0
+    }
+
+    /// Whether only the secondary core has work (the primary idles until
+    /// an interrupt) and it may run a batch.
+    fn secondary_ready(&self) -> bool {
+        let Some(core) = &self.secondary else {
+            return false;
+        };
+        let control = self.bus.core_control(1);
+        self.time_warp
+            && control & 2 == 0
+            && control & 0x18 == 8
+            && self.bus.core_control(0) & 16 == 0
+            && self.idle
+            && !self.bus_locked
+            && !core.idle
+            && !core.bus_locked
+            && core.idle_wake_delay == 0
+    }
+
+    /// Run a batch on the secondary core while the primary idles: guest
+    /// time follows the secondary's instructions (as the primary's idle
+    /// steps would in `step`), and it may fast-forward the secondary's
+    /// waits since nothing else runs. Then the primary may wake.
+    fn secondary_batch(&mut self, max: u64, blocks: &mut dyn BlockRunner) -> Result<u64, Fault> {
+        let mut secondary = self.secondary.take().unwrap();
+        secondary.swap(self);
+        let start_pc = self.pc;
+        let result = self.run_core(max, blocks).and_then(|(count, poll_pc)| {
+            self.finish_batch(count, start_pc, poll_pc)?;
+            Ok(count)
+        });
+        secondary.swap(self);
+        self.secondary = Some(secondary);
+        let count = result?;
+        if count != 0 {
+            self.dispatch_interrupt()?;
+        }
+        Ok(count)
     }
 
     pub(crate) fn prepared(&mut self, pc: u32) -> Option<Instruction> {
@@ -257,8 +298,8 @@ impl Cpu {
         self.steps += count;
         self.batched_steps += count;
         let warp = match poll_pc {
-            Some(_) => self.warp_ticks(poll_pc),
-            None if self.idle => self.warp_ticks(None),
+            _ if self.idle => self.warp_ticks(None),
+            Some(_) => self.warp_ticks(poll_pc).max(self.spin_ticks(count)),
             None => self.spin_ticks(count),
         };
         let ticks = self.bus.instruction_ticks_n(count) as u32 + warp;
@@ -281,11 +322,13 @@ impl Cpu {
         let counters = self.batch_counters();
         let locked = self.bus_locked;
         let gate = self.interrupt_gate();
+        let code = (self.bus.translation_generation(), self.bus.sram_code_generation());
         let (pc, name) = self.execute_current()?;
         let stop = self.batch_counters() != counters
             || self.needs_interpreter()
             || self.bus_locked != locked
-            || self.interrupt_gate() != gate;
+            || self.interrupt_gate() != gate
+            || (self.bus.translation_generation(), self.bus.sram_code_generation()) != code;
         Ok((pc, name, stop))
     }
 
@@ -356,7 +399,17 @@ impl Cpu {
     ) -> Option<crate::wasmjit::Block> {
         let mut layout = self.jit_layout();
         layout.chain = chain;
-        crate::wasmjit::translate(&self.bus, &mut self.decode, &layout, pc)
+        if !(crate::XIP..crate::XIP_END).contains(&pc) {
+            layout.xip_check = Some((
+                self.bus.translation_generation_address() as usize as u32,
+                self.bus.translation_generation(),
+            ));
+        }
+        let block = crate::wasmjit::translate(&self.bus, &mut self.decode, &layout, pc)?;
+        for &(start, end) in &block.ranges {
+            self.bus.mark_code(start, end);
+        }
+        Some(block)
     }
 
     /// Addresses of the state translated code works on. Valid while this
@@ -378,6 +431,8 @@ impl Cpu {
                 .map(|(start, end, host)| (start, end, address(host)))
                 .collect(),
             chain: None,
+            code_marks: Some(address(self.bus.code_marks_address())),
+            xip_check: None,
         }
     }
 }

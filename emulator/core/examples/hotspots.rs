@@ -16,6 +16,9 @@ fn main() -> Result<(), String> {
     cpu.step_many(warmup).map_err(|e| e.to_string())?;
     let (steps, ticks, batched) = (cpu.steps, cpu.bus.oscillator_ticks, cpu.batched_steps);
     let started = std::time::Instant::now();
+    if env::var_os("DEVICES").is_some() {
+        *cpu.bus.device_log.borrow_mut() = Some(HashMap::new());
+    }
     let mut pcs: HashMap<u32, u64> = HashMap::new();
     let mut samples = 0u64;
     let (mut code_changes, mut translation_changes) = (0, 0);
@@ -36,6 +39,13 @@ fn main() -> Result<(), String> {
         (cpu.batched_steps - batched) as f64 * 100.0 / (cpu.steps - steps) as f64
     );
     println!("{} steps in {guest:.3} guest s = {:.1} M instr per guest s", cpu.steps - steps, (cpu.steps - steps) as f64 / guest / 1e6);
+    if let Some(log) = cpu.bus.device_log.borrow_mut().take() {
+        let mut log: Vec<_> = log.into_iter().collect();
+        log.sort_by(|a, b| b.1.cmp(&a.1));
+        for (address, count) in log.into_iter().take(10) {
+            println!("device {address:08x}: {count}");
+        }
+    }
     let mut hot: Vec<_> = pcs.into_iter().collect();
     hot.sort_by(|a, b| b.1.cmp(&a.1));
     for (pc, count) in hot.into_iter().take(40) {

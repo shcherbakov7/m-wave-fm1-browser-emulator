@@ -19,6 +19,8 @@ const STATE_WRITES: u32 = 0x188;
 const STATE_CHAIN: u32 = 0x1c0;
 /// Write-protection window table (see `Layout::guards`).
 const STATE_GUARDS: u32 = 0x1e0;
+/// SRAM code marks (see `Layout::code_marks`).
+const STATE_MARKS: u32 = 0x8000;
 const STATE_RAM: u32 = 0x10000;
 const STATE_XIP: u32 = 0x90000;
 
@@ -31,6 +33,8 @@ fn layout(cpu: &Cpu) -> Layout {
         writes: STATE_WRITES,
         interrupts: STATE_IRQ,
         guards: STATE_GUARDS,
+        code_marks: Some(STATE_MARKS),
+        xip_check: None,
         xip: vec![(XIP, XIP + cpu.bus.flash.len() as u32, STATE_XIP)],
         chain: None,
     }
@@ -94,6 +98,8 @@ fn to_wasm(memory: &mut [u8], cpu: &Cpu) {
     put(memory, STATE_WRITES, cpu.bus.writes);
     memory[STATE_IRQ as usize] = cpu.interrupts_enabled as u8;
     put_guards(memory, cpu);
+    let marks = cpu.bus.code_marks();
+    memory[STATE_MARKS as usize..STATE_MARKS as usize + marks.len()].copy_from_slice(marks);
     let flash = &cpu.bus.flash;
     memory[STATE_XIP as usize..STATE_XIP as usize + flash.len()].copy_from_slice(flash);
     let ram = cpu.bus.ram();
@@ -168,8 +174,11 @@ fn compare(code: &[u16], rng: &mut Rng) -> (&'static str, bool) {
 /// Translate up to `limit` instructions; the interpreter then runs as many
 /// instructions as the block reports.
 fn compare_block(code: &[u16], rng: &mut Rng, limit: u32) -> (&'static str, bool) {
-    compare_guarded(code, rng, limit, None, false)
+    compare_guarded(code, rng, limit, None, false, XIP)
 }
+
+/// Runs whose code overwrote translated SRAM code.
+static CODE_OVERWRITES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Flag updates the translator skipped as dead.
 pub(super) static SKIPPED_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -185,16 +194,28 @@ fn compare_guarded(
     limit: u32,
     window: Option<(u32, u32)>,
     chained: bool,
+    at: u32,
 ) -> (&'static str, bool) {
-    let mut reference = cpu_with(code);
+    let in_sram = at != XIP;
+    let mut reference = cpu_with(if in_sram { &[0] } else { code });
     random_state(rng, &mut reference);
+    if in_sram {
+        // The code in SRAM, and a pointer to it so that stores may hit it.
+        let offset = (at - RAM) as usize;
+        for (i, word) in code.iter().enumerate() {
+            reference.bus.ram_mut()[offset + 2 * i..offset + 2 * i + 2]
+                .copy_from_slice(&word.to_le_bytes());
+        }
+        reference.pc = at;
+        reference.r[rng.below(16) as usize] = at + (rng.below(64) & !3);
+    }
     if chained {
         // Returns and register jumps back to the start chain into the
-        // block itself (the chain table holds it at XIP).
-        reference.sr[3] = XIP;
-        reference.r[rng.below(16) as usize] = XIP;
+        // block itself (the chain table holds it at `at`).
+        reference.sr[3] = at;
+        reference.r[rng.below(16) as usize] = at;
     }
-    let mut host_cpu = cpu_with(code);
+    let mut host_cpu = cpu_with(if in_sram { &[0] } else { code });
     if let Some((low, high)) = window {
         for cpu in [&mut reference, &mut host_cpu] {
             cpu.bus.write(0x1eee2c0, low, 4).unwrap();
@@ -220,12 +241,16 @@ fn compare_guarded(
         &reference.bus,
         &mut crate::decode::Cache::new(),
         &block_layout,
-        XIP,
+        at,
         limit,
         if limit == 1 { 1 } else { 6 },
     )
     .expect("translatable");
     wasmparser::validate(&block.wasm).expect("valid wasm");
+    for &(start, end) in &block.ranges {
+        reference.bus.mark_code(start, end);
+        host_cpu.bus.mark_code(start, end);
+    }
 
     let before = capture(&reference);
 
@@ -245,7 +270,7 @@ fn compare_guarded(
     {
         let (data, host) = memory.data_and_store_mut(&mut store);
         to_wasm(data, &host.cpu);
-        put(data, STATE_CHAIN, XIP);
+        put(data, STATE_CHAIN, at);
         put(data, STATE_CHAIN + 4, 0);
     }
     let mut linker = Linker::<Host>::new(&engine);
@@ -345,6 +370,9 @@ fn compare_guarded(
         reference.bus.ram() == jit.bus.ram(),
         "{code:04x?} ({name}): SRAM differs"
     );
+    if reference.bus.sram_code_generation() != 0 {
+        CODE_OVERWRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     (name, store.data().exec_calls == 0)
 }
 
@@ -459,12 +487,28 @@ fn chained_sequences_match_the_interpreter() {
             code.extend_from_slice(&random_code(&mut rng));
         }
         let before = LONGEST_RUN.load(std::sync::atomic::Ordering::Relaxed);
-        compare_guarded(&code, &mut rng, 8, None, true);
+        compare_guarded(&code, &mut rng, 8, None, true, XIP);
         chained += (LONGEST_RUN.load(std::sync::atomic::Ordering::Relaxed) > before) as u32;
     }
     // Some calls must have gone round through the chain table (a block
     // here has at most 8 instructions per pass).
     assert!(LONGEST_RUN.load(std::sync::atomic::Ordering::Relaxed) > 8 * 6, "{chained}");
+}
+
+#[test]
+fn sram_sequences_match_the_interpreter() {
+    let mut rng = Rng(0x5a4d_c0de_0007);
+    for _ in 0..8_000 {
+        let mut code = Vec::new();
+        for _ in 0..8 {
+            code.extend_from_slice(&random_code(&mut rng));
+        }
+        let at = RAM + 0x2000 + (rng.below(0x100) & !1);
+        let chained = rng.below(2) == 0;
+        compare_guarded(&code, &mut rng, 8, None, chained, at);
+    }
+    // Some stores hit the translated code itself.
+    assert!(CODE_OVERWRITES.load(std::sync::atomic::Ordering::Relaxed) > 0);
 }
 
 #[test]
@@ -475,7 +519,7 @@ fn stores_into_a_write_protection_window_fault_like_the_interpreter() {
         // A window around the pointers random_state hands out.
         let low = RAM + 0x1000 + (rng.below(0x7c000) & !3);
         let high = low + rng.below(0x8000);
-        compare_guarded(&code, &mut rng, 1, Some((low, high)), false);
+        compare_guarded(&code, &mut rng, 1, Some((low, high)), false, XIP);
     }
 }
 

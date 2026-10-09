@@ -121,7 +121,18 @@ pub struct Bus {
     /// Direct-mapped cache of XIP instruction halfwords, tagged with the
     /// address and the NOR generation in force when they were read.
     code_cache: Box<[CodeEntry]>,
+    /// SRAM in `CODE_CHUNK`-byte chunks: nonzero where translated code was
+    /// read from. Translated stores to a marked chunk take the slow path.
+    code_marks: Box<[u8]>,
+    /// Bumped (and the marks cleared) when marked SRAM is written.
+    sram_code: u32,
+    /// While translating: the lowest and highest instruction addresses
+    /// fetched (see `fetched`).
+    fetch_log: std::cell::Cell<(u32, u32)>,
 }
+
+/// Granularity of `Bus::code_marks`.
+pub const CODE_CHUNK: u32 = 64;
 
 #[derive(Clone, Copy)]
 struct CodeEntry {
@@ -181,7 +192,58 @@ impl Bus {
                 CODE_SLOTS
             ]
             .into_boxed_slice(),
+            code_marks: vec![0; RAM_SIZE / CODE_CHUNK as usize].into_boxed_slice(),
+            sram_code: 0,
+            fetch_log: std::cell::Cell::new((u32::MAX, 0)),
         })
+    }
+
+    /// Note SRAM `[start, end)` as holding translated code.
+    pub(crate) fn mark_code(&mut self, start: u32, end: u32) {
+        if start >= end || !(RAM..RAM + RAM_SIZE as u32).contains(&start) {
+            return;
+        }
+        let end = end.min(RAM + RAM_SIZE as u32);
+        for chunk in (start - RAM) / CODE_CHUNK..=(end - 1 - RAM) / CODE_CHUNK {
+            self.code_marks[chunk as usize] = 1;
+        }
+    }
+
+    /// Before SRAM bytes `[offset, offset + size)` change: drop translations
+    /// of code there.
+    fn writing_ram(&mut self, offset: usize, size: usize) {
+        let chunk = CODE_CHUNK as usize;
+        if self.code_marks[offset / chunk] | self.code_marks[(offset + size - 1) / chunk] != 0 {
+            self.sram_code = self.sram_code.wrapping_add(1);
+            self.code_marks.fill(0);
+        }
+    }
+
+    /// Version of the code in SRAM (see `code_marks`).
+    pub fn sram_code_generation(&self) -> u32 {
+        self.sram_code
+    }
+
+    #[cfg(test)]
+    pub(crate) fn code_marks(&self) -> &[u8] {
+        &self.code_marks
+    }
+
+    /// Where translated code finds `code_marks`.
+    pub(crate) fn code_marks_address(&self) -> *const u8 {
+        self.code_marks.as_ptr()
+    }
+
+    /// Start recording instruction fetches (for marking translated SRAM).
+    pub(crate) fn start_fetch_log(&self) {
+        self.fetch_log.set((u32::MAX, 0));
+    }
+
+    /// The `[low, high)` span of instruction halfwords fetched since
+    /// `start_fetch_log`, if any.
+    pub(crate) fn fetched(&self) -> Option<(u32, u32)> {
+        let (low, high) = self.fetch_log.get();
+        (low < high).then_some((low, high))
     }
 
     fn fault(
@@ -392,6 +454,8 @@ impl Bus {
     }
 
     pub fn fetch(&self, address: u32) -> Result<u16, AccessFault> {
+        let (low, high) = self.fetch_log.get();
+        self.fetch_log.set((low.min(address), high.max(address + 2)));
         let entry = self.code_cache[(address >> 1) as usize & (CODE_SLOTS - 1)];
         if entry.address == address && entry.generation == self.nor.generation {
             return Ok(entry.word);
@@ -409,11 +473,17 @@ impl Bus {
 
     pub fn write(&mut self, address: u32, value: u32, size: usize) -> Result<(), AccessFault> {
         Self::check(address, size, "write")?;
-        self.writes = self.writes.wrapping_add(1);
+        // Restarting a free-running timer's count is part of waiting on it
+        // (delay loops that accumulate and clear TIMERx CNT), not a side
+        // effect that makes a polling loop do work.
+        if address != crate::devices::TIMER4 + 4 && address != crate::devices::TIMER5 + 4 {
+            self.writes = self.writes.wrapping_add(1);
+        }
         if let Some(offset) = Self::offset(address, size, RAM, self.ram.len()) {
             self.guards
                 .check_write(address, size)
                 .map_err(|reason| Self::fault(address, size, "write", reason))?;
+            self.writing_ram(offset, size);
             self.ram[offset..offset + size].copy_from_slice(&value.to_le_bytes()[..size]);
             return Ok(());
         }
@@ -556,6 +626,7 @@ impl Bus {
                 "unmapped memory, read-only XIP, or unimplemented MMIO",
             )
         })?;
+        self.writing_ram(offset, size);
         self.ram[offset..offset + size].copy_from_slice(&value.to_le_bytes()[..size]);
         Ok(())
     }
@@ -595,6 +666,11 @@ impl Bus {
     /// write-protection windows in place (`guard_table`).
     pub fn translation_generation(&self) -> u32 {
         self.nor.generation
+    }
+
+    /// Where `translation_generation` is kept.
+    pub(crate) fn translation_generation_address(&self) -> *const u32 {
+        &self.nor.generation
     }
 
     /// Whether code can run from XIP flash now.

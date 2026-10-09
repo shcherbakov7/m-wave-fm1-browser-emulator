@@ -24,6 +24,8 @@ let half = null; // { time, guest } once half the steps ran: steady-state speed 
 for (let done = 0; done < total && status === 0; done += 4_000_000) {
   if (!half && done >= total / 2) half = { time: performance.now(), guest: x.fm1_guest_seconds() };
   status = x.fm1_run(Math.min(4_000_000, total - done));
+  // PROFILE_EXEC_AFTER=steps: count interpreter calls only after warm-up.
+  if (process.env.PROFILE_EXEC_AFTER && done < Number(process.env.PROFILE_EXEC_AFTER) && done + 4_000_000 >= Number(process.env.PROFILE_EXEC_AFTER)) x.fm1_profile_exec(1);
 }
 const end = performance.now();
 const seconds = (end - start) / 1000;
@@ -32,7 +34,7 @@ const info = JSON.parse(message());
 console.log(JSON.stringify({ status, seconds: +seconds.toFixed(2), mStepsPerSec: +(info.steps / 1e6 / seconds).toFixed(1), realtime: +(info.guestSeconds / seconds).toFixed(3),
   steadyRealtime: half ? +((info.guestSeconds - half.guest) * 1000 / (end - half.time)).toFixed(3) : null, ...info }));
 
-if (process.env.PROFILE_EXEC) { x.fm1_profile_exec(0); console.log(message()); }
+if (process.env.PROFILE_EXEC || process.env.PROFILE_EXEC_AFTER) { x.fm1_profile_exec(0); console.log(message()); }
 if (pngPath) {
   const lcdPtr = x.fm1_lcd();
   if (!lcdPtr) throw new Error("no LCD frame");

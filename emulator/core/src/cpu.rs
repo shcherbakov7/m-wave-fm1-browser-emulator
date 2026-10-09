@@ -184,9 +184,12 @@ pub struct Cpu {
     warp_allowed: bool,
     /// Last timer poll: (pc, steps, bus writes, irq entries).
     last_poll: (u32, u64, u32, u64),
-    /// State at the end of the previous batch, to recognize a core spinning
-    /// on memory (see `spin_ticks`).
-    last_spin: Box<Spin>,
+    /// States at the end of the last few batches, to recognize a core
+    /// spinning (see `spin_ticks`), and the next one to replace.
+    last_spin: Box<[Spin; SPIN_HISTORY]>,
+    spin_cursor: usize,
+    /// Consecutive batches recognized as spinning.
+    spin_streak: u32,
     fast: fast::Cache,
     /// Steps executed by batches (diagnostics).
     pub batched_steps: u64,
@@ -200,12 +203,19 @@ pub struct Cpu {
 /// device events still arrive in order, at most 1 µs late.
 const WARP_TICKS: u32 = 24;
 
-/// A core's registers, PC and the bus write and IRQ counters, as compared
-/// between batches by `Cpu::spin_ticks`.
+/// Batch-end states remembered by `Cpu::spin_ticks`: a waiting loop may
+/// end its batches at a few different points (after each device access).
+const SPIN_HISTORY: usize = 4;
+/// Most guest time one spinning batch may skip (100 µs): a long wait
+/// doubles its step each batch up to this, which also bounds how late an
+/// interrupt or device event can be noticed.
+const SPIN_WARP_LIMIT: u32 = 2_400;
+
+/// A core's registers, PC and IRQ count, as compared between batches by
+/// `Cpu::spin_ticks`.
 #[derive(Default, PartialEq)]
 struct Spin {
     pc: u32,
-    writes: u32,
     irqs: u64,
     r: [u32; 16],
     sr: [u32; 16],
@@ -316,7 +326,9 @@ impl Cpu {
             time_warp: true,
             warp_allowed: false,
             last_poll: (u32::MAX, 0, 0, 0),
-            last_spin: Box::new(Spin::default()),
+            last_spin: Box::default(),
+            spin_cursor: 0,
+            spin_streak: 0,
             fast: Default::default(),
             batched_steps: 0,
             unbatched_ops: None,
@@ -421,23 +433,33 @@ impl Cpu {
     }
 
     /// Extra guest time for a batch of `count` instructions that left this
-    /// core exactly as the previous batch did: same PC and registers, and no
-    /// memory written or interrupt taken in between. It is waiting for
-    /// something outside it (an interrupt, a device, DMA), so fast-forward
-    /// as `warp_ticks` does. Only for a core that runs alone.
+    /// core exactly as one of the last few batches did: same PC and
+    /// registers, and no interrupt taken in between. Whatever it stored meanwhile (say, return
+    /// addresses of the calls in its loop) it computed from the same state,
+    /// so it is waiting for something outside it (an interrupt, a device,
+    /// the timer, DMA): fast-forward as `warp_ticks` does. Only for a core
+    /// that runs alone.
     pub(crate) fn spin_ticks(&mut self, count: u64) -> u32 {
         let spin = Spin {
             pc: self.pc,
-            writes: self.bus.writes,
             irqs: self.irq_entries,
             r: self.r,
             sr: self.sr,
         };
-        let same = *self.last_spin == spin;
-        *self.last_spin = spin;
-        if same && self.runs_alone() {
-            WARP_TICKS * count.min(64) as u32
+        if !self.runs_alone() {
+            // Both cores run (an interrupt handler on the other, say): no
+            // fast-forward, but a wait around it keeps its pace.
+            return 0;
+        }
+        let same = self.last_spin.contains(&spin);
+        self.last_spin[self.spin_cursor] = spin;
+        self.spin_cursor = (self.spin_cursor + 1) % SPIN_HISTORY;
+        if same {
+            let ticks = (WARP_TICKS * count.min(64) as u32) << self.spin_streak.min(8);
+            self.spin_streak += 1;
+            ticks.min(SPIN_WARP_LIMIT)
         } else {
+            self.spin_streak = 0;
             0
         }
     }
