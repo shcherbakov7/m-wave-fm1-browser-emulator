@@ -3,7 +3,6 @@
 // the device runs at its real speed: each slice runs the guest up to "now"
 // (bounded host time so input stays responsive), then sleeps if it is ahead.
 // Streams LCD frames, audio (straight to the audio worklet) and status.
-import { instantiateFm1 } from "./fm1-host.js";
 
 const SLICE_MS = 8;           // host time per slice before yielding to messages
 const MAX_LAG_S = 0.1;        // further behind than this: drop the backlog
@@ -32,6 +31,8 @@ const message = () => {
 };
 
 async function init(wasmUrl) {
+  // Same build stamp as this worker (see app.js).
+  const { instantiateFm1 } = await import(`./fm1-host.js${new URL(import.meta.url).search}`);
   const response = await fetch(wasmUrl);
   x = await instantiateFm1(await response.arrayBuffer());
   audioPtr = x.fm1_alloc(AUDIO_CHUNK * 2 * 4);

@@ -203,3 +203,23 @@ select.primary option, select.primary optgroup { background: var(--panel); color
 }
 .about small { color: var(--muted); }
 .about-error { margin: 0 0 8px; color: #ffd5d1; }
+.firmware-card { background: var(--panel); border-radius: 8px; padding: 10px 12px; }
+.firmware-card h2 { margin: 0 0 8px; font-size: 15px; }
+.firmware-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
+.fw {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left;
+  background: #1a1c20; color: var(--text); border: 1px solid #3a3e45; border-radius: 8px;
+  padding: 8px 10px; font: inherit; cursor: pointer; min-height: 48px;
+}
+.fw span { font-weight: 600; }
+.fw small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.fw:hover { border-color: #5a606a; }
+.fw.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.fw.own { border-style: dashed; }
+@media (max-width: 600px) {
+  .bar { padding: 10px 12px; }
+  .actions { width: 100%; display: grid; grid-template-columns: repeat(3, 1fr); }
+  .actions #firmware { grid-column: 1 / -1; }
+  .actions label.button { display: none; }   /* own files: in the firmware card */
+  .actions .button, .actions select { padding: 8px 6px; text-align: center; }
+}
