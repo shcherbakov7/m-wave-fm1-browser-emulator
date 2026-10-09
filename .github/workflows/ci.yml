@@ -28,6 +28,12 @@ jobs:
         run: tools/build-web.sh
       - name: Fetch the newest open firmwares
         run: node tools/update-firmware.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Check them in the emulator
+        run: |
+          cargo build --release --manifest-path emulator/Cargo.toml --example diagnose
+          node tools/check-firmware.mjs
       - name: Package site
         run: |
           mkdir -p _site

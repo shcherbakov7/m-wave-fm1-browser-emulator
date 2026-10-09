@@ -131,6 +131,7 @@ function showAbout(entry, error = "") {
   about.innerHTML = `${error ? `<p class="about-error">${error}</p>` : ""}
     <strong>${escape(entry.name)} ${escape(entry.version)}</strong> — ${escape(entry.author)}<br>
     ${escape(entry.description)}<br>
+    ${entry.check ? `<small>${entry.check.ok ? "✓ проверена в эмуляторе при сборке сайта" : `⚠ в эмуляторе останавливается: ${escape(entry.check.stop || "экран пуст")}`}</small><br>` : ""}
     <small>${escape(entry.license)}${entry.date ? ` · ${escape(entry.date)}` : ""} ·
     <a href="${escape(link)}" target="_blank" rel="noopener">${entry.source ? "исходники и инструкции" : "страница загрузки"}</a></small>`;
 }
@@ -253,7 +254,8 @@ async function refreshRecent() {
   const official = catalog.filter((e) => e.url), open = catalog.filter((e) => e.file);
   const groups = [new Option("Выбрать прошивку…", "")];
   if (official.length) groups.push(group("Официальная", official.map((e) => new Option(`${e.name} ${e.version}`, `c:${e.id}`))));
-  if (open.length) groups.push(group("Открытые прошивки", open.map((e) => new Option(`${e.name} ${e.version} — ${e.author}`, `c:${e.id}`))));
+  const mark = (e) => (e.check && !e.check.ok ? " ⚠" : "");
+  if (open.length) groups.push(group("Открытые прошивки", open.map((e) => new Option(`${e.name} ${e.version} — ${e.author}${mark(e)}`, `c:${e.id}`))));
   if (saved.length) groups.push(group("Ваши файлы (недавние)", saved.map((e) => new Option(e.name, `r:${e.name}`))));
   $("firmware").replaceChildren(...groups);
 }
