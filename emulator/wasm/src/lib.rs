@@ -273,7 +273,7 @@ pub extern "C" fn fm1_status() -> usize {
                 #[cfg(target_arch = "wasm32")]
                 let jit = format!(
                     "{{\"enabled\":{},\"compiled\":{},\"failed\":{},\"translatedSteps\":{},\
-                     \"blockCalls\":{},\"execCalls\":{},\"batches\":{}}}",
+                     \"blockCalls\":{},\"execCalls\":{},\"batchedSteps\":{}}}",
                     m.jit.enabled,
                     m.jit.stats.compiled,
                     m.jit.stats.failed,
@@ -281,7 +281,7 @@ pub extern "C" fn fm1_status() -> usize {
                     m.jit.stats.block_calls,
                     // SAFETY: plain read on the single host thread.
                     unsafe { *std::ptr::addr_of!(jit::EXEC_CALLS) },
-                    m.jit.stats.batches
+                    cpu.batched_steps
                 );
                 #[cfg(not(target_arch = "wasm32"))]
                 let jit = "null".to_string();
@@ -362,4 +362,16 @@ pub extern "C" fn fm1_profile_exec(start: u32) -> usize {
         let _ = start;
         0
     }
+}
+
+/// Turn per-block verification against the interpreter on (1) or off (0).
+#[no_mangle]
+pub extern "C" fn fm1_set_jit_verify(enabled: u32) {
+    with(|_m| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            _m.jit.verify = enabled != 0;
+        }
+        let _ = enabled;
+    })
 }

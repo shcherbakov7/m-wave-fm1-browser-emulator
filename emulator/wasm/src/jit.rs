@@ -4,10 +4,10 @@
 //! Hot XIP blocks are translated by `fm1_emu::wasmjit`, compiled by the
 //! JavaScript host (`env.jit_compile`, which instantiates the module and
 //! appends its function to this module's indirect function table) and then
-//! called through that table. Batches follow `Cpu::step_many`: devices,
-//! guest time and interrupts are updated once per batch, and a batch ends
-//! after a device access or timer poll.
-use fm1_emu::cpu::Cpu;
+//! called through that table. `Jit` is a `BlockRunner`, so batching (devices,
+//! guest time and interrupts updated once per batch) is `Cpu::step_many_with`.
+use fm1_emu::cpu::fast::{BlockRunner, PreparedRunner};
+use fm1_emu::cpu::{Cpu, Fault};
 use std::collections::HashMap;
 
 #[link(wasm_import_module = "env")]
@@ -18,8 +18,6 @@ extern "C" {
 
 /// Executions before a block is translated.
 const HOT: u32 = 16;
-/// Instructions per batch before devices and interrupts are updated.
-const BATCH: u64 = 256;
 
 #[derive(Clone, Copy)]
 enum Slot {
@@ -100,7 +98,6 @@ pub struct Stats {
     pub failed: u32,
     pub translated_steps: u64,
     pub block_calls: u64,
-    pub batches: u64,
 }
 
 /// Interpreter calls made by translated blocks.
@@ -112,7 +109,34 @@ pub struct Jit {
     slots: Vec<(u32, Slot)>,
     generation: u32,
     pub enabled: bool,
+    /// Check every block without interpreter calls against the interpreter
+    /// (slow; diagnostics). A mismatch stops emulation with a report.
+    pub verify: bool,
+    pub verified: u64,
     pub stats: Stats,
+}
+
+impl BlockRunner for Jit {
+    fn run(&mut self, cpu: &mut Cpu) -> Option<Result<(u64, u32), Fault>> {
+        let pc = cpu.pc;
+        let Some(function) = self.block(cpu, pc) else {
+            return PreparedRunner.run(cpu);
+        };
+        let result = if self.verify {
+            self.verify_block(cpu, pc, function)
+        } else {
+            Self::call(cpu, function)
+        };
+        Some(match result {
+            Ok(executed) => {
+                self.stats.translated_steps += executed as u64;
+                self.stats.block_calls += 1;
+                // SAFETY: plain read of the shared state.
+                Ok((executed as u64, unsafe { (*std::ptr::addr_of!(EXEC)).pc }))
+            }
+            Err(message) => Err(Fault::Host(message)),
+        })
+    }
 }
 
 impl Jit {
@@ -121,6 +145,8 @@ impl Jit {
             slots: vec![(u32::MAX, Slot::Unavailable); SLOTS],
             generation: u32::MAX,
             enabled: true,
+            verify: false,
+            verified: 0,
             stats: Stats::default(),
         }
     }
@@ -171,63 +197,90 @@ impl Jit {
 
     /// Execute `budget` steps, using translated blocks where possible.
     pub fn run(&mut self, cpu: &mut Cpu, budget: u64) -> Result<(), String> {
-        let end = cpu.steps.saturating_add(budget);
-        while cpu.steps < end {
-            if !self.enabled || !cpu.batch_ready() {
-                cpu.step_many(1).map_err(|error| error.to_string())?;
-                continue;
-            }
-            let start_pc = cpu.pc;
-            let (devices, polls) = cpu.batch_counters();
-            let mut count = 0u64;
-            let mut poll_pc = None;
-            while count < BATCH && !cpu.is_idle() {
-                let pc = cpu.pc;
-                let block = if cpu.needs_interpreter() {
-                    None
-                } else {
-                    self.block(cpu, pc)
-                };
-                let last_pc = match block {
-                    Some(function) => {
-                        // SAFETY: see `fm1_jit_exec`. `cpu` is not used while
-                        // the block runs; it reaches the CPU only via EXEC.
-                        let executed = unsafe {
-                            let exec = &mut *std::ptr::addr_of_mut!(EXEC);
-                            exec.cpu = cpu as *mut Cpu;
-                            exec.pc = u32::MAX;
-                            let executed = function();
-                            exec.cpu = std::ptr::null_mut();
-                            if let Some(fault) = exec.fault.take() {
-                                return Err(fault);
-                            }
-                            executed
-                        };
-                        count += executed as u64;
-                        self.stats.translated_steps += executed as u64;
-                        self.stats.block_calls += 1;
-                        // SAFETY: plain read of the shared state.
-                        unsafe { (*std::ptr::addr_of!(EXEC)).pc }
-                    }
-                    None => {
-                        let (pc, _) = cpu.interpret().map_err(|error| error.to_string())?;
-                        count += 1;
-                        pc
-                    }
-                };
-                let (now_devices, now_polls) = cpu.batch_counters();
-                if now_polls != polls {
-                    poll_pc = Some(last_pc);
-                    break;
-                }
-                if now_devices != devices {
-                    break;
-                }
-            }
-            self.stats.batches += 1;
-            cpu.finish_batch(count, start_pc, poll_pc)
-                .map_err(|error| error.to_string())?;
+        if !self.enabled {
+            return cpu.step_many(budget).map_err(|error| error.to_string());
         }
-        Ok(())
+        cpu.step_many_with(budget, self).map_err(|error| error.to_string())
+    }
+
+    fn call(cpu: &mut Cpu, function: extern "C" fn() -> u32) -> Result<u32, String> {
+        // SAFETY: as in `run`.
+        unsafe {
+            let exec = &mut *std::ptr::addr_of_mut!(EXEC);
+            exec.cpu = cpu as *mut Cpu;
+            exec.pc = u32::MAX;
+            let executed = function();
+            exec.cpu = std::ptr::null_mut();
+            if let Some(fault) = exec.fault.take() {
+                return Err(fault);
+            }
+            Ok(executed)
+        }
+    }
+
+    /// Run a block, then rerun the same instructions in the interpreter from
+    /// the saved state and require identical registers and SRAM.
+    fn verify_block(
+        &mut self,
+        cpu: &mut Cpu,
+        pc: u32,
+        function: extern "C" fn() -> u32,
+    ) -> Result<u32, String> {
+        let before = cpu.block_state();
+        let ram_before = cpu.bus.ram().to_vec();
+        // SAFETY: plain reads on the single host thread.
+        let calls = unsafe { *std::ptr::addr_of!(EXEC_CALLS) };
+        let executed = Self::call(cpu, function)?;
+        if unsafe { *std::ptr::addr_of!(EXEC_CALLS) } != calls {
+            return Ok(executed); // devices may have been touched: not repeatable
+        }
+        let translated = cpu.block_state();
+        let ram_translated = cpu.bus.ram().to_vec();
+        cpu.set_block_state(before);
+        cpu.bus.ram_mut().copy_from_slice(&ram_before);
+        for _ in 0..executed {
+            cpu.interpret().map_err(|error| error.to_string())?;
+        }
+        let interpreted = cpu.block_state();
+        let mut differences = Vec::new();
+        for i in 0..16 {
+            if translated.0[i] != interpreted.0[i] {
+                differences.push(format!("r{i} {:08x}≠{:08x}", translated.0[i], interpreted.0[i]));
+            }
+            if translated.1[i] != interpreted.1[i] {
+                differences.push(format!("sr{i} {:08x}≠{:08x}", translated.1[i], interpreted.1[i]));
+            }
+        }
+        if translated.2 != interpreted.2 {
+            differences.push(format!("pc {:08x}≠{:08x}", translated.2, interpreted.2));
+        }
+        if translated.3 != interpreted.3 {
+            differences.push("interrupt enable".into());
+        }
+        if translated.4 != interpreted.4 {
+            differences.push(format!("writes {}≠{}", translated.4, interpreted.4));
+        }
+        let ram = cpu.bus.ram();
+        if let Some(offset) = (0..ram.len()).find(|&i| ram[i] != ram_translated[i]) {
+            differences.push(format!(
+                "SRAM {:08x}: {:02x}≠{:02x}",
+                fm1_emu::RAM + offset as u32,
+                ram_translated[offset],
+                ram[offset]
+            ));
+        }
+        self.verified += 1;
+        if differences.is_empty() {
+            return Ok(executed);
+        }
+        let regs: Vec<String> = before.0.iter().map(|v| format!("{v:08x}")).collect();
+        Err(format!(
+            "JIT mismatch in block {pc:08x} after {executed} instructions (translated≠interpreted): {}; \
+             entry r=[{}] sr5={:08x} sr14={:08x}",
+            differences.join(", "),
+            regs.join(" "),
+            before.1[5],
+            before.1[14]
+        ))
     }
 }

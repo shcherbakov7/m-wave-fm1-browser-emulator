@@ -8,7 +8,7 @@ use crate::{
 };
 use std::{fmt, io::Write};
 
-mod fast;
+pub mod fast;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Fault {
@@ -17,6 +17,8 @@ pub enum Fault {
     Limit { pc: u32, limit: u64 },
     Preservation,
     Trace(String),
+    /// A failure reported by the host (e.g. translated code).
+    Host(String),
 }
 
 #[cfg(test)]
@@ -139,6 +141,7 @@ impl fmt::Display for Fault {
             Self::Limit { pc, limit } => write!(f, "instruction limit {limit} at PC 0x{pc:08x}"),
             Self::Preservation => write!(f, "probe did not preserve registers or stack"),
             Self::Trace(message) => write!(f, "trace: {message}"),
+            Self::Host(message) => write!(f, "{message}"),
         }
     }
 }

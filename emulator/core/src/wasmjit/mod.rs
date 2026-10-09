@@ -1715,12 +1715,12 @@ fn wide_instruction(
                 .u32(0xff00_ff00)
                 .op(I32_AND)
                 .u32(8)
-                .op(I32_ROTR)
+                .op(I32_ROTL)
                 .get(LEFT)
                 .u32(0x00ff_00ff)
                 .op(I32_AND)
                 .u32(8)
-                .op(I32_ROTL)
+                .op(I32_ROTR)
                 .op(I32_OR)
                 .set(VALUE);
             t.set_r(d, VALUE);

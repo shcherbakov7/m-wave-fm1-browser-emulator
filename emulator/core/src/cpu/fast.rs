@@ -40,14 +40,50 @@ impl Default for Cache {
     }
 }
 
+/// Runs code for the instruction at the CPU's PC faster than the
+/// interpreter (prepared forms, or translated blocks in the browser).
+pub trait BlockRunner {
+    /// Run code at `cpu.pc`, returning how many instructions ran and the PC
+    /// of the last one, or `None` to let the interpreter run one instruction.
+    /// It must leave state exactly as the interpreter would.
+    fn run(&mut self, cpu: &mut Cpu) -> Option<Result<(u64, u32), Fault>>;
+}
+
+/// The built-in runner: one prepared simple instruction at a time.
+pub struct PreparedRunner;
+
+impl BlockRunner for PreparedRunner {
+    fn run(&mut self, cpu: &mut Cpu) -> Option<Result<(u64, u32), Fault>> {
+        let pc = cpu.pc;
+        let instruction = cpu.prepared(pc)?;
+        Some(instruction.execute(cpu).map(|_| (1, pc)))
+    }
+}
+
 impl Cpu {
     /// Execute `budget` steps, batching simple instructions where possible.
     /// Equivalent to calling `step` `budget` times, except that interrupts
     /// and device-visible time are only checked between batches.
     pub fn step_many(&mut self, budget: u64) -> Result<(), Fault> {
+        self.step_many_with(budget, &mut PreparedRunner)
+    }
+
+    /// As `step_many`, running code through `blocks` where it can. While
+    /// both cores have work, each runs a batch in turn: the primary's
+    /// instructions set the guest time and the secondary runs at most as
+    /// many (it interleaves per batch rather than per instruction).
+    pub fn step_many_with(&mut self, budget: u64, blocks: &mut dyn BlockRunner) -> Result<(), Fault> {
         let end = self.steps.saturating_add(budget);
         while self.steps < end {
-            if self.batch_ready() && self.batch((end - self.steps).min(BATCH))? != 0 {
+            let max = (end - self.steps).min(BATCH);
+            if self.batch_ready() {
+                let start_pc = self.pc;
+                let (count, poll_pc) = self.run_core(max, blocks)?;
+                if count != 0 {
+                    self.finish_batch(count, start_pc, poll_pc)?;
+                    continue;
+                }
+            } else if self.dual_ready() && self.dual_batch(max, blocks)? != 0 {
                 continue;
             }
             let op = self.step()?;
@@ -77,7 +113,25 @@ impl Cpu {
         }
     }
 
-    fn prepared(&mut self, pc: u32) -> Option<Instruction> {
+    /// Whether both cores have work and may run batches in turn.
+    fn dual_ready(&self) -> bool {
+        let Some(core) = &self.secondary else {
+            return false;
+        };
+        let control = self.bus.core_control(1);
+        self.time_warp
+            && control & 2 == 0
+            && control & 0x18 == 8
+            && self.bus.core_control(0) & 16 == 0
+            && !self.idle
+            && !core.idle
+            && !self.bus_locked
+            && !core.bus_locked
+            && self.idle_wake_delay == 0
+            && core.idle_wake_delay == 0
+    }
+
+    pub(crate) fn prepared(&mut self, pc: u32) -> Option<Instruction> {
         if !(crate::XIP..crate::XIP_END).contains(&pc) {
             return None;
         }
@@ -101,41 +155,63 @@ impl Cpu {
         instruction
     }
 
-    /// Run up to `max` instructions; returns how many ran. Prepared simple
-    /// forms run directly, everything else through the interpreter. A batch
-    /// ends after any device-register access, so devices lag by at most the
-    /// batch, and after a timer poll so waits can be fast-forwarded.
-    fn batch(&mut self, max: u64) -> Result<u64, Fault> {
-        let start_pc = self.pc;
+    /// Run up to about `max` instructions on the current core without time
+    /// or interrupts: through `blocks` where possible, else the interpreter.
+    /// Stops after a timed device access, or after a timer poll (returning
+    /// its PC so the wait can be fast-forwarded), or when the core idles.
+    fn run_core(
+        &mut self,
+        max: u64,
+        blocks: &mut dyn BlockRunner,
+    ) -> Result<(u64, Option<u32>), Fault> {
         let mut count = 0;
-        let mut poll_pc = None;
         while count < max && !self.idle {
-            let devices = self.bus.device_accesses.get();
-            let polls = self.bus.timer_polls.get();
+            let (devices, polls) = self.batch_counters();
             let pc = self.pc;
-            let prepared = if self.predicate_skip.is_none() && self.repeat.is_none() {
-                self.prepared(pc)
+            let ran = if self.predicate_skip.is_none() && self.repeat.is_none() {
+                blocks.run(self).transpose()?
             } else {
                 None
             };
-            match prepared {
-                Some(instruction) => {
-                    instruction.execute(self)?;
-                }
+            let (executed, last_pc) = match ran {
+                Some(ran) => ran,
                 None => {
                     self.execute_current()?;
+                    (1, pc)
                 }
+            };
+            count += executed;
+            let (now_devices, now_polls) = self.batch_counters();
+            if now_polls != polls {
+                return Ok((count, Some(last_pc)));
             }
-            count += 1;
-            if self.bus.timer_polls.get() != polls {
-                poll_pc = Some(pc);
-                break;
-            }
-            if self.bus.device_accesses.get() != devices {
+            if now_devices != devices {
                 break;
             }
         }
-        self.finish_batch(count, start_pc, poll_pc)?;
+        Ok((count, None))
+    }
+
+    /// One batch on each core: the primary first, then the secondary for at
+    /// most as many instructions; guest time follows the primary.
+    fn dual_batch(&mut self, max: u64, blocks: &mut dyn BlockRunner) -> Result<u64, Fault> {
+        let start_pc = self.pc;
+        let (count, _) = self.run_core(max, blocks)?;
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut secondary = self.secondary.take().unwrap();
+        secondary.swap(self);
+        let result = self.run_core(count, blocks).and_then(|(executed, _)| {
+            self.steps += executed;
+            self.batched_steps += executed;
+            self.idle_wake_delay = self.idle_wake_delay.saturating_sub(executed.min(255) as u8);
+            self.dispatch_interrupt()
+        });
+        secondary.swap(self);
+        self.secondary = Some(secondary);
+        result?;
+        self.finish_batch(count, start_pc, None)?;
         Ok(count)
     }
 
@@ -188,8 +264,25 @@ impl Cpu {
         self.execute_current()
     }
 
+    #[cfg(test)]
     pub(crate) fn predicate(&self) -> Option<(u32, u32)> {
         self.predicate_skip
+    }
+
+    /// Register-level state a translated block may change (diagnostics):
+    /// r, sr, pc, interrupt enable and the bus write counter.
+    pub fn block_state(&self) -> ([u32; 16], [u32; 16], u32, bool, u32) {
+        (
+            self.r,
+            self.sr,
+            self.pc,
+            self.interrupts_enabled,
+            self.bus.writes,
+        )
+    }
+
+    pub fn set_block_state(&mut self, state: ([u32; 16], [u32; 16], u32, bool, u32)) {
+        (self.r, self.sr, self.pc, self.interrupts_enabled, self.bus.writes) = state;
     }
 
     /// Counters a batch watches: device-register accesses and timer polls.

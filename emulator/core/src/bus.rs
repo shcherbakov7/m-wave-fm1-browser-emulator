@@ -620,11 +620,11 @@ impl Bus {
         self.nor.xip_segments(XIP, end)
     }
 
-    pub(crate) fn ram(&self) -> &[u8] {
+    pub fn ram(&self) -> &[u8] {
         &self.ram
     }
 
-    pub(crate) fn ram_mut(&mut self) -> &mut [u8] {
+    pub fn ram_mut(&mut self) -> &mut [u8] {
         &mut self.ram
     }
 

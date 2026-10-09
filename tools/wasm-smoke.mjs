@@ -14,6 +14,7 @@ const ptr = x.fm1_alloc(firmware.length);
 mem().set(firmware, ptr);
 if (x.fm1_load(ptr, firmware.length) !== 0) throw new Error(message());
 if (process.env.NOJIT) x.fm1_set_jit(0);
+if (process.env.VERIFY) x.fm1_set_jit_verify(1);
 if (process.env.PROFILE_EXEC) x.fm1_profile_exec(1);
 
 const total = Number(stepsArg);

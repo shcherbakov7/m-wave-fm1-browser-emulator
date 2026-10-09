@@ -407,3 +407,117 @@ fn stores_into_a_write_protection_window_fault_like_the_interpreter() {
         compare_guarded(&code, &mut rng, 1, Some((low, high)));
     }
 }
+
+/// Differential check on real firmware: while the interpreter runs the
+/// image in FM1_FIRMWARE, translate single instructions it is about to run
+/// (each PC up to 3 times) and compare the translation, from the same state,
+/// with the interpreter's result. Instructions that call the interpreter
+/// are skipped.
+#[test]
+#[ignore = "needs FM1_FIRMWARE=path/to/firmware.fwsc"]
+fn firmware_instructions_match_the_interpreter() {
+    let path = std::env::var("FM1_FIRMWARE").expect("FM1_FIRMWARE");
+    let steps: u64 = std::env::var("FM1_STEPS").map_or(40_000_000, |v| v.parse().unwrap());
+    let firmware = crate::firmware::Firmware::from_bytes(std::fs::read(path).unwrap()).unwrap();
+    let mut cpu = Cpu::new(firmware.bus().unwrap(), firmware.entry);
+    cpu.r[0] = 0x01c7_fe08;
+    let mut seen: std::collections::HashMap<u32, u32> = Default::default();
+    let mut decode = crate::decode::Cache::new();
+    let engine = Engine::default();
+    let mut checked = 0;
+    while cpu.steps < steps {
+        let pc = cpu.pc;
+        let candidate = (XIP..XIP_END).contains(&pc)
+            && cpu.batch_ready()
+            && !cpu.needs_interpreter()
+            && *seen.entry(pc).or_default() < 3;
+        if !candidate {
+            cpu.step().unwrap();
+            continue;
+        }
+        *seen.get_mut(&pc).unwrap() += 1;
+        // Translation of exactly this instruction, run in wasmi.
+        let mut layout = layout(&cpu);
+        layout.xip = Vec::new(); // flash reads go through exec here
+        let block = translate_limited(&cpu.bus, &mut decode, &layout, pc, 1, 1).unwrap();
+        let before = capture(&cpu);
+        let ram_before = cpu.bus.ram().to_vec();
+        let mut store = Store::new(
+            &engine,
+            Host {
+                cpu: cpu_with(&[0]),
+                memory: None,
+                exec_calls: 0,
+                fault: false,
+            },
+        );
+        let pages = (STATE_XIP + 0x10000).div_ceil(65536) + 1;
+        let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
+        store.data_mut().memory = Some(memory);
+        {
+            let data = memory.data_mut(&mut store);
+            for i in 0..16 {
+                put(data, STATE_R + 4 * i, cpu.r[i as usize]);
+                put(data, STATE_SR + 4 * i, cpu.sr[i as usize]);
+            }
+            put(data, STATE_PC, cpu.pc);
+            put(data, STATE_WRITES, cpu.bus.writes);
+            data[STATE_IRQ as usize] = cpu.interrupts_enabled as u8;
+            data[STATE_RAM as usize..STATE_RAM as usize + ram_before.len()]
+                .copy_from_slice(&ram_before);
+        }
+        let mut linker = Linker::<Host>::new(&engine);
+        linker.define("env", "memory", memory).unwrap();
+        linker
+            .func_wrap("env", "exec", |mut caller: Caller<'_, Host>| -> i32 {
+                caller.data_mut().exec_calls += 1;
+                1
+            })
+            .unwrap();
+        linker
+            .func_wrap("env", "exec_pred", |mut caller: Caller<'_, Host>, _: i32, _: i32| -> i32 {
+                caller.data_mut().exec_calls += 1;
+                1
+            })
+            .unwrap();
+        let module = Module::new(&engine, &block.wasm).unwrap();
+        let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+        let run = instance.get_typed_func::<(), i32>(&store, "b").unwrap();
+        let count = run.call(&mut store, ()).unwrap();
+        let (_, name) = cpu.execute_current().unwrap();
+        if store.data().exec_calls != 0 || count != 1 {
+            continue;
+        }
+        checked += 1;
+        let data = memory.data(&store);
+        let mut translated = capture(&cpu);
+        for i in 0..16 {
+            translated.r[i as usize] = word(data, STATE_R + 4 * i);
+            translated.sr[i as usize] = word(data, STATE_SR + 4 * i);
+        }
+        translated.pc = word(data, STATE_PC);
+        translated.writes = word(data, STATE_WRITES);
+        translated.interrupts = data[STATE_IRQ as usize] != 0;
+        let words: Vec<String> = (0..3)
+            .map(|i| format!("{:04x}", cpu.bus.fetch(pc + 2 * i).unwrap_or(0)))
+            .collect();
+        assert_eq!(
+            translated,
+            capture(&cpu),
+            "{pc:08x} {} ({name}) from {before:08x?}: translation (left) vs interpreter (right)",
+            words.join(" ")
+        );
+        let ram = cpu.bus.ram();
+        let jit_ram = &data[STATE_RAM as usize..STATE_RAM as usize + ram.len()];
+        if let Some(offset) = (0..ram.len()).find(|&i| ram[i] != jit_ram[i]) {
+            panic!(
+                "{pc:08x} {} ({name}): SRAM {:08x} translated {:02x} interpreted {:02x}",
+                words.join(" "),
+                RAM + offset as u32,
+                jit_ram[offset],
+                ram[offset]
+            );
+        }
+    }
+    eprintln!("checked {checked} instructions at {} PCs", seen.len());
+}
