@@ -30,11 +30,12 @@ const message = () => {
   return new TextDecoder().decode(mem().slice(ptr, ptr + x.fm1_message_len()));
 };
 
-async function init(wasmUrl) {
+async function init(wasmUrl, mode = {}) {
   // Same build stamp as this worker (see app.js).
   const { instantiateFm1 } = await import(`./fm1-host.js${new URL(import.meta.url).search}`);
   const response = await fetch(wasmUrl);
-  x = await instantiateFm1(await response.arrayBuffer());
+  x = await instantiateFm1(await response.arrayBuffer(), { chaining: mode.chaining !== false });
+  if (mode.jit === false) x.fm1_set_jit(0);
   audioPtr = x.fm1_alloc(AUDIO_CHUNK * 2 * 4);
   serialPtr = x.fm1_alloc(4096);
   postMessage({ type: "ready" });
@@ -158,7 +159,7 @@ function wake() {
 
 onmessage =({ data }) => {
   switch (data.type) {
-    case "init": init(data.wasmUrl).catch((error) => postMessage({ type: "error", message: String(error) })); break;
+    case "init": init(data.wasmUrl, data.mode).catch((error) => postMessage({ type: "error", message: String(error) })); break;
     case "load": load(data.bytes, data.name); break;
     case "key": if (x) x.fm1_key(data.id, data.down ? 1 : 0); break;
     case "encoder": if (x) x.fm1_encoder(data.index, data.steps); break;

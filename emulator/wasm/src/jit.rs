@@ -109,10 +109,35 @@ pub static mut EXEC_CALLS: u64 = 0;
 /// When profiling, interpreter calls from blocks by operation name and PC.
 pub static mut EXEC_OPS: Option<HashMap<(&'static str, u32), u64>> = None;
 
+/// Hashes a block's PC (a u32) with one multiply.
+#[derive(Default)]
+struct PcHasher(u64);
+
+impl std::hash::Hasher for PcHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ byte as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    fn write_u32(&mut self, value: u32) {
+        self.0 = (value as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(32)
+    }
+}
+
+type BuildPcHasher = std::hash::BuildHasherDefault<PcHasher>;
+
 pub struct Jit {
-    slots: Vec<(u32, Slot)>,
-    /// Chain table for translated code: `[pc, table index]` per slot, so a
-    /// block can go straight on to the next one (see `Layout::chain`).
+    /// Every block seen, by entry PC: counting towards translation, ready,
+    /// or not translatable. Blocks never evict each other; they are dropped
+    /// only when the code they were translated from changes.
+    blocks: HashMap<u32, Slot, BuildPcHasher>,
+    /// Chain table for translated code: `[pc, table index]` by
+    /// `(pc >> 1) & (SLOTS - 1)`, so a block can go straight on to the next
+    /// one (see `Layout::chain`). Direct-mapped: of two colliding blocks the
+    /// one entered last is chained to; the other returns to `block`.
     chain: Vec<[u32; 2]>,
     /// Whether the host supports tail calls, which chaining needs.
     pub chaining: bool,
@@ -170,17 +195,20 @@ impl Jit {
 
     /// Drop the translations of blocks starting at PCs matching `stale`.
     fn release_where(&mut self, stale: impl Fn(u32) -> bool) {
-        for (index, (pc, slot)) in self.slots.iter_mut().enumerate() {
-            if *pc == u32::MAX || !stale(*pc) {
-                continue;
+        self.blocks.retain(|&pc, slot| {
+            if !stale(pc) {
+                return true;
             }
             if let Slot::Ready(function) = slot {
                 // SAFETY: host import; nothing calls the index any more.
                 unsafe { jit_release(*function as usize as i32) };
             }
-            *pc = u32::MAX;
-            *slot = Slot::Unavailable;
-            self.chain[index] = [u32::MAX, 0];
+            false
+        });
+        for entry in &mut self.chain {
+            if entry[0] != u32::MAX && stale(entry[0]) {
+                *entry = [u32::MAX, 0];
+            }
         }
     }
 
@@ -204,9 +232,9 @@ impl Jit {
             self.generation = generation;
             self.xip_chain_off = false;
         } else if !self.xip_chain_off {
-            for (index, (pc, _)) in self.slots.iter().enumerate() {
-                if xip(*pc) {
-                    self.chain[index] = [u32::MAX, 0];
+            for entry in &mut self.chain {
+                if xip(entry[0]) {
+                    *entry = [u32::MAX, 0];
                 }
             }
             self.xip_chain_off = true;
@@ -215,7 +243,7 @@ impl Jit {
 
     pub fn new() -> Self {
         Self {
-            slots: vec![(u32::MAX, Slot::Unavailable); SLOTS],
+            blocks: HashMap::default(),
             chain: vec![[u32::MAX, 0]; SLOTS],
             chaining: false,
             generation: u32::MAX,
@@ -236,19 +264,11 @@ impl Jit {
             return None; // XIP is off: let the interpreter fault
         }
         let index = (pc >> 1) as usize & (SLOTS - 1);
-        let entry = &mut self.slots[index];
-        if entry.0 != pc {
-            if let Slot::Ready(function) = entry.1 {
-                // A colliding block takes the slot (and its chain entry).
-                self.chain[index] = [u32::MAX, 0];
-                // SAFETY: host import; nothing refers to the index any more.
-                unsafe { jit_release(function as usize as i32) };
-            }
-            *entry = (pc, Slot::Counting(0));
-        }
-        match &mut entry.1 {
+        let slot = self.blocks.entry(pc).or_insert(Slot::Counting(0));
+        match slot {
             Slot::Ready(function) => {
-                // Its chain entry may have been cleared while XIP was off.
+                // Chain to it from now on (its entry may have been taken by
+                // a colliding block, or cleared while XIP was off).
                 self.chain[index] = [pc, *function as usize as u32];
                 return Some(*function);
             }
@@ -272,7 +292,7 @@ impl Jit {
                 std::mem::transmute::<usize, extern "C" fn(u32) -> u32>(index as usize)
             })
         });
-        self.slots[index].1 = match compiled {
+        let slot = match compiled {
             Some(function) => {
                 self.stats.compiled += 1;
                 self.chain[index] = [pc, function as usize as u32];
@@ -283,6 +303,7 @@ impl Jit {
                 Slot::Unavailable
             }
         };
+        self.blocks.insert(pc, slot);
         compiled
     }
 
