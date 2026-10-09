@@ -45,6 +45,11 @@ pub struct Layout {
     /// Side-effect-free XIP reads: guest `[start, end)` at host `host +
     /// (address - start)`, for each segment.
     pub xip: Vec<(u32, u32, u32)>,
+    /// Block chaining: a table of `(pc, function table index)` u32 pairs
+    /// indexed by `(pc >> 1) & mask`, and the mask. When set, a region that
+    /// leaves for a PC with a matching entry tail-calls that block directly
+    /// (modules then import `env.table`, the host's function table).
+    pub chain: Option<(u32, u32)>,
 }
 
 pub struct Block {
@@ -64,21 +69,25 @@ const MAX_REGION_INSTRUCTIONS: u32 = 768;
 const BUDGET: u32 = 256;
 
 // Locals.
-const ADDR: u32 = 0;
-const VALUE: u32 = 1;
-const LEFT: u32 = 2;
-const RIGHT: u32 = 3;
-const RESULT: u32 = 4;
-const WRITEBACK: u32 = 5;
-/// Instructions completed in earlier basic blocks of this call.
-const COUNT: u32 = 6;
+/// Instructions completed in earlier basic blocks of this call (the
+/// function's parameter: chained blocks receive the running total).
+const COUNT: u32 = 0;
+const ADDR: u32 = 1;
+const VALUE: u32 = 2;
+const LEFT: u32 = 3;
+const RIGHT: u32 = 4;
+const RESULT: u32 = 5;
+const WRITEBACK: u32 = 6;
 /// Index of the next basic block, for the region's dispatch loop.
 const NEXT_BLOCK: u32 = 7;
 /// Parallel bundles: incoming registers (r0..r15, sr0..sr15) and the
 /// following slot's results.
 const SNAPSHOT: u32 = 8;
 const FOLLOWING: u32 = SNAPSHOT + 32;
-const LOCALS: u32 = FOLLOWING + 32;
+/// Guest registers cached for the whole region: r0..r15, then sr0..sr15
+/// (only those the region uses are loaded and stored back).
+const REG: u32 = FOLLOWING + 32;
+const LOCALS: u32 = REG + 32;
 
 /// The imported interpreter step, and its form for an instruction inside the
 /// selected arm of a conditional block: (then_end, end) -> i32.
@@ -170,6 +179,36 @@ struct Translator<'a> {
     /// Inside a slot of the parallel bundle at this PC: the interpreter must
     /// run the whole bundle, and the block ends after it.
     bundle: Option<u32>,
+    /// Registers (bit i: r[i], bit 16 + i: sr[i]) read and written by the
+    /// code emitted so far.
+    used: u32,
+    written: u32,
+    /// Registers held in locals (from the scan pass): loaded on entry and
+    /// after the interpreter ran, and the subset stored back to the CPU
+    /// before it runs or the region returns.
+    cached: u32,
+    dirty: u32,
+    /// PSR flag liveness: the events of the current basic block (from the
+    /// scan pass), the block's start and the instruction being emitted.
+    flags: Vec<FlagEvent>,
+    block_start: u32,
+    pc: u32,
+    /// Flag updates (by `FlagEvent::Write` key) that a later update in the
+    /// same basic block overwrites before anything can read them.
+    dead_flags: std::collections::HashSet<(u32, u32, u32)>,
+    /// Emitting nested code (a conditional arm or a bundle slot), where
+    /// every flag update is kept.
+    nested_code: bool,
+}
+
+/// What a basic block does with the PSR flags, in emission order.
+#[derive(Clone, Copy, PartialEq)]
+enum FlagEvent {
+    /// NZCV recomputed: (block start, instruction PC, update index within
+    /// the instruction).
+    Write((u32, u32, u32)),
+    /// PSR read, or code that may read it (the interpreter, any exit).
+    Read,
 }
 
 impl<'a> Translator<'a> {
@@ -184,6 +223,15 @@ impl<'a> Translator<'a> {
             predicate: None,
             used_exec: false,
             bundle: None,
+            used: 0,
+            written: 0,
+            cached: 0,
+            dirty: 0,
+            flags: Vec::new(),
+            block_start: 0,
+            pc: 0,
+            dead_flags: Default::default(),
+            nested_code: false,
         }
     }
     /// A translator for code nested inside this one's current position.
@@ -198,27 +246,73 @@ impl<'a> Translator<'a> {
             predicate: self.predicate,
             used_exec: false,
             bundle: self.bundle,
+            used: 0,
+            written: 0,
+            cached: self.cached,
+            dirty: self.dirty,
+            flags: Vec::new(),
+            block_start: self.block_start,
+            pc: self.pc,
+            dead_flags: Default::default(),
+            nested_code: true,
         }
+    }
+    /// Take on the register use of code nested in this translator.
+    fn absorb(&mut self, nested: &Self) {
+        self.used |= nested.used;
+        self.written |= nested.written;
     }
 }
 
 impl Translator<'_> {
     fn r(&mut self, n: usize) {
-        self.body.i32(0).load(4, false, self.layout.r + 4 * n as u32);
+        self.used |= 1 << n;
+        self.body.get(REG + n as u32);
     }
     fn sr(&mut self, n: usize) {
-        self.body.i32(0).load(4, false, self.layout.sr + 4 * n as u32);
+        if n == 5 {
+            self.flags.push(FlagEvent::Read);
+        }
+        self.used |= 1 << (16 + n);
+        self.body.get(REG + 16 + n as u32);
     }
     /// `r[n] = local`.
     fn set_r(&mut self, n: usize, local: u32) {
-        self.body.i32(0).get(local).store(4, self.layout.r + 4 * n as u32);
+        self.written |= 1 << n;
+        self.body.get(local).set(REG + n as u32);
     }
     fn set_sr(&mut self, n: usize, local: u32) {
-        self.body.i32(0).get(local).store(4, self.layout.sr + 4 * n as u32);
+        self.written |= 1 << (16 + n);
+        self.body.get(local).set(REG + 16 + n as u32);
     }
     /// `r[n] = constant`.
     fn set_r_const(&mut self, n: usize, value: u32) {
-        self.body.i32(0).u32(value).store(4, self.layout.r + 4 * n as u32);
+        self.written |= 1 << n;
+        self.body.u32(value).set(REG + n as u32);
+    }
+    /// CPU address of cached register `i` (see `REG`).
+    fn register_address(&self, i: u32) -> u32 {
+        if i < 16 {
+            self.layout.r + 4 * i
+        } else {
+            self.layout.sr + 4 * (i - 16)
+        }
+    }
+    /// Load the cached registers from the CPU.
+    fn reload(&mut self) {
+        for i in (0..32).filter(|i| self.cached & (1 << i) != 0) {
+            let address = self.register_address(i);
+            self.body.i32(0).load(4, false, address).set(REG + i);
+        }
+    }
+    /// Store the cached registers the region may change back to the CPU
+    /// (before every exit and interpreter call, so it also reads the flags).
+    fn flush(&mut self) {
+        self.flags.push(FlagEvent::Read);
+        for i in (0..32).filter(|i| self.dirty & (1 << i) != 0) {
+            let address = self.register_address(i);
+            self.body.i32(0).get(REG + i).store(4, address);
+        }
     }
     fn set_pc_const(&mut self, pc: u32) {
         self.body.i32(0).u32(pc).store(4, self.layout.pc);
@@ -238,9 +332,51 @@ impl Translator<'_> {
             Base::Sp => self.set_sr(14, local),
         }
     }
-    /// Return after the current instruction, which ran to completion.
-    fn finish(&mut self) {
+    /// Return after the current instruction, which ran to completion, with
+    /// the CPU's registers already current.
+    fn finish_flushed(&mut self) {
         self.body.get(COUNT).u32(self.count + 1).op(I32_ADD).ret();
+    }
+    /// Store the registers and go on at the new PC: straight to its
+    /// translated block when there is one and the budget allows, else by
+    /// returning after the current instruction.
+    fn leave(&mut self) {
+        self.flush();
+        self.leave_flushed();
+    }
+    fn leave_flushed(&mut self) {
+        self.body.get(COUNT).u32(self.count + 1).op(I32_ADD).set(COUNT);
+        self.chain();
+        self.body.get(COUNT).ret();
+    }
+    /// With COUNT up to date and PC stored: tail-call the block for PC if
+    /// the chain table has it and the budget is not spent.
+    fn chain(&mut self) {
+        let Some((table, mask)) = self.layout.chain else { return };
+        self.body.get(COUNT).u32(BUDGET).op(I32_LT_U).if_();
+        self.body
+            .i32(0)
+            .load(4, false, self.layout.pc)
+            .set(ADDR)
+            .get(ADDR)
+            .i32(1)
+            .op(I32_SHR_U)
+            .u32(mask)
+            .op(I32_AND)
+            .i32(3)
+            .op(I32_SHL)
+            .set(VALUE)
+            .get(VALUE)
+            .load(4, false, table)
+            .get(ADDR)
+            .op(I32_EQ)
+            .if_()
+            .get(COUNT)
+            .get(VALUE)
+            .load(4, false, table + 4)
+            .return_call_indirect(BLOCK_TYPE, 0)
+            .end()
+            .end();
     }
     /// Continue at a static `target` after the current instruction: inside
     /// the region by its dispatch loop (unless the budget is spent), else by
@@ -249,12 +385,12 @@ impl Translator<'_> {
         self.successors.push(target);
         let Some((index, current, blocks)) = self.region else {
             self.set_pc_const(target);
-            self.finish();
+            self.leave();
             return;
         };
         let Some(&block) = index.get(&target) else {
             self.set_pc_const(target);
-            self.finish();
+            self.leave();
             return;
         };
         self.body
@@ -267,8 +403,10 @@ impl Translator<'_> {
             .op(I32_GE_U)
             .if_();
         self.set_pc_const(target);
+        self.flush();
         self.body.get(COUNT).ret().end();
         self.body.u32(block as u32).set(NEXT_BLOCK);
+        self.flags.push(FlagEvent::Read); // live into the next block
         // Blocks after the current one are still open around it.
         self.body.br(blocks as u32 - 1 - current as u32 + self.depth);
     }
@@ -276,15 +414,19 @@ impl Translator<'_> {
     fn exec(&mut self, pc: u32) {
         self.used_exec = true;
         self.set_pc_const(self.bundle.unwrap_or(pc));
+        self.flush();
         match self.predicate {
             Some((then_end, end)) => {
                 self.body.u32(then_end).u32(end).call(EXEC_PREDICATED).op(DROP);
             }
             None => {
-                self.body.call(EXEC).op(DROP);
+                // Chain on unless the interpreter asked to stop.
+                self.body.call(EXEC).op(I32_EQZ).if_();
+                self.leave_flushed();
+                self.body.end();
             }
         }
-        self.finish();
+        self.finish_flushed();
     }
     /// Run the current instruction (ending at `next`) in the interpreter; the
     /// block goes on with the next instruction unless the interpreter
@@ -297,7 +439,8 @@ impl Translator<'_> {
         }
         self.used_exec = true;
         self.set_pc_const(pc);
-        self.body.call(EXEC).op(I32_EQZ);
+        self.flush();
+        self.body.call(EXEC).set(RESULT).get(RESULT).op(I32_EQZ);
         self.body
             .i32(0)
             .load(4, false, self.layout.pc)
@@ -306,8 +449,13 @@ impl Translator<'_> {
             .op(I32_AND)
             .op(I32_EQZ)
             .if_();
-        self.finish();
+        // Control went elsewhere: chain on unless the interpreter stopped.
+        self.body.get(RESULT).op(I32_EQZ).if_();
+        self.leave_flushed();
         self.body.end();
+        self.finish_flushed();
+        self.body.end();
+        self.reload();
     }
     /// Pushes 1 when `[ADDR + low, ADDR + high)` is aligned SRAM that the
     /// translated code may access directly (`size` gives the alignment).
@@ -502,7 +650,7 @@ impl Translator<'_> {
         self.body.get(ADDR).i32(4 * words).op(I32_ADD).set(VALUE);
         self.set_sr(14, VALUE);
         if flow == Flow::End {
-            self.finish();
+            self.leave();
         }
         self.body.else_();
         self.exec(pc);
@@ -518,8 +666,25 @@ impl Translator<'_> {
             .get(RIGHT)
             .op(if subtract { I32_SUB } else { I32_ADD })
             .set(RESULT);
-        // VALUE = PSR with NZCV recomputed.
-        self.sr(5);
+        let ordinal = self
+            .flags
+            .iter()
+            .filter(|event| matches!(event, FlagEvent::Write((_, pc, _)) if *pc == self.pc))
+            .count() as u32;
+        let key = (self.block_start, self.pc, ordinal);
+        if !self.nested_code {
+            self.flags.push(FlagEvent::Write(key));
+            if self.dead_flags.contains(&key) {
+                // Overwritten before any read: skip computing it.
+                #[cfg(test)]
+                tests::SKIPPED_FLAGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.set_r(dest, RESULT);
+                return;
+            }
+        }
+        // VALUE = PSR with NZCV recomputed (keeping the other bits).
+        self.used |= 1 << (16 + 5);
+        self.body.get(REG + 16 + 5);
         self.body.i32(!15).op(I32_AND);
         // V: signed overflow.
         if subtract {
@@ -604,9 +769,19 @@ pub(crate) fn translate_limited(
     let mut blocks = vec![start];
     let mut total = 0;
     let mut next = 0;
+    let (mut used, mut written) = (0, 0);
+    let mut dead_flags = std::collections::HashSet::new();
     while next < blocks.len() {
         let mut scan = Translator::new(layout);
-        let Some(instructions) = basic_block(&mut scan, bus, decode, blocks[next], limit) else {
+        let instructions = basic_block(&mut scan, bus, decode, blocks[next], limit);
+        used |= scan.used;
+        written |= scan.written;
+        for pair in scan.flags.windows(2) {
+            if let [FlagEvent::Write(key), FlagEvent::Write(_)] = pair {
+                dead_flags.insert(*key);
+            }
+        }
+        let Some(instructions) = instructions else {
             if next == 0 {
                 return None;
             }
@@ -630,8 +805,14 @@ pub(crate) fn translate_limited(
     let index: std::collections::HashMap<u32, usize> =
         blocks.iter().enumerate().map(|(i, &pc)| (pc, i)).collect();
     let mut t = Translator::new(layout);
+    // A register written on one path is stored back on every path, so it
+    // must hold the CPU's value until then.
+    t.cached = used | written;
+    t.dirty = written;
+    t.dead_flags = dead_flags;
+    t.reload();
     let n = blocks.len();
-    t.body.i32(0).set(COUNT).i32(0).set(NEXT_BLOCK).loop_();
+    t.body.i32(0).set(NEXT_BLOCK).loop_();
     for _ in 0..n {
         t.body.block();
     }
@@ -645,10 +826,14 @@ pub(crate) fn translate_limited(
         }
     }
     t.body.end().unreachable();
+    if (t.used | t.written) & !t.cached != 0 || t.written & !t.dirty != 0 {
+        debug_assert!(false, "region at {start:08x} uses registers the scan missed");
+        return None;
+    }
     Some(Block {
         start,
         instructions: total,
-        wasm: module(&t.body, LOCALS),
+        wasm: module(&t.body, LOCALS - 1, layout.chain.is_some()),
     })
 }
 
@@ -663,14 +848,18 @@ fn basic_block(
 ) -> Option<u32> {
     t.count = 0;
     t.depth = 0;
+    t.block_start = start;
+    t.flags.clear();
     let mut pc = start;
     loop {
+        t.pc = pc;
         let Ok(h) = bus.fetch(pc) else {
             if pc == start {
                 return None;
             }
             // Let the interpreter raise the fetch fault.
             t.set_pc_const(pc);
+            t.flush();
             t.body.get(COUNT).u32(t.count).op(I32_ADD).ret();
             return Some(t.count);
         };
@@ -945,7 +1134,7 @@ fn instruction(
             t.sr(3);
             t.body.set(VALUE);
             t.set_pc_local(VALUE);
-            t.finish();
+            t.leave();
             Some((Flow::End, 2))
         }
         First::CallReg => {
@@ -954,7 +1143,7 @@ fn instruction(
             t.body.set(ADDR);
             t.set_sr(3, VALUE);
             t.set_pc_local(ADDR);
-            t.finish();
+            t.leave();
             Some((Flow::End, 2))
         }
         First::SyncOrNop => Some((Flow::Continue, 2)),
@@ -1125,7 +1314,7 @@ fn extended_instruction(
             t.r(n);
             t.body.set(VALUE);
             t.set_pc_local(VALUE);
-            t.finish();
+            t.leave();
             Some((Flow::End, 2))
         }
         Extended::MemorySmall => {
@@ -1919,6 +2108,8 @@ fn conditional(
             _ => break,
         }
     }
+    t.absorb(&arm);
+    t.flags.push(FlagEvent::Read); // the arm keeps and may read the flags
     if cursor != then_end {
         t.exec(pc);
         return None;
@@ -2003,34 +2194,36 @@ fn parallel(
             && word & 0xf800 != 0xf000)
             .then_some(following_length)
     });
+    t.absorb(&second);
+    t.absorb(&first);
+    t.flags.push(FlagEvent::Read); // slots keep and may read the flags
     let Some(following_length) = slots else {
         t.exec(pc);
         return None;
     };
-    let (r, sr) = (t.layout.r, t.layout.sr);
-    let register = |i: u32| if i < 16 { r + 4 * i } else { sr + 4 * (i - 16) };
-    for i in 0..32 {
-        t.body.i32(0).load(4, false, register(i)).set(SNAPSHOT + i);
+    // Registers either slot touches; the others keep their values.
+    let touched: Vec<u32> = (0..32)
+        .filter(|i| (second.used | second.written | first.used | first.written) & (1 << i) != 0)
+        .collect();
+    for &i in &touched {
+        t.body.get(REG + i).set(SNAPSHOT + i);
     }
     t.body.bytes.extend_from_slice(&second.body.bytes);
-    for i in 0..32 {
-        t.body.i32(0).load(4, false, register(i)).set(FOLLOWING + i);
-        t.body.i32(0).get(SNAPSHOT + i).store(4, register(i));
+    for &i in &touched {
+        t.body.get(REG + i).set(FOLLOWING + i);
+        t.body.get(SNAPSHOT + i).set(REG + i);
     }
     t.body.bytes.extend_from_slice(&first.body.bytes);
-    for i in 0..32 {
+    for &i in &touched {
         // Keep the primary's write; else take the following slot's value.
         t.body
-            .i32(0)
             .get(FOLLOWING + i)
-            .i32(0)
-            .load(4, false, register(i))
-            .i32(0)
-            .load(4, false, register(i))
+            .get(REG + i)
+            .get(REG + i)
             .get(SNAPSHOT + i)
             .op(I32_EQ)
             .op(SELECT)
-            .store(4, register(i));
+            .set(REG + i);
     }
     Some((Flow::Continue, length + following_length))
 }

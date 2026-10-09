@@ -22,7 +22,7 @@ const HOT: u32 = 16;
 #[derive(Clone, Copy)]
 enum Slot {
     Counting(u32),
-    Ready(extern "C" fn() -> u32),
+    Ready(extern "C" fn(u32) -> u32),
     Unavailable,
 }
 
@@ -107,12 +107,20 @@ pub static mut EXEC_OPS: Option<HashMap<(&'static str, u32), u64>> = None;
 
 pub struct Jit {
     slots: Vec<(u32, Slot)>,
+    /// Chain table for translated code: `[pc, table index]` per slot, so a
+    /// block can go straight on to the next one (see `Layout::chain`).
+    chain: Vec<[u32; 2]>,
+    /// Whether the host supports tail calls, which chaining needs.
+    pub chaining: bool,
     generation: u32,
     pub enabled: bool,
     /// Check every block without interpreter calls against the interpreter
-    /// (slow; diagnostics). A mismatch stops emulation with a report.
+    /// (the first few calls at each entry PC; slow, for diagnostics). A
+    /// mismatch stops emulation with a report.
     pub verify: bool,
     pub verified: u64,
+    /// Verified calls per block entry PC (each is checked a few times).
+    checks: HashMap<u32, u32>,
     pub stats: Stats,
 }
 
@@ -122,7 +130,7 @@ impl BlockRunner for Jit {
         let Some(function) = self.block(cpu, pc) else {
             return PreparedRunner.run(cpu);
         };
-        let result = if self.verify {
+        let result = if self.verify && self.sample(pc) {
             self.verify_block(cpu, pc, function)
         } else {
             Self::call(cpu, function)
@@ -143,20 +151,24 @@ impl Jit {
     pub fn new() -> Self {
         Self {
             slots: vec![(u32::MAX, Slot::Unavailable); SLOTS],
+            chain: vec![[u32::MAX, 0]; SLOTS],
+            chaining: false,
             generation: u32::MAX,
             enabled: true,
             verify: false,
             verified: 0,
+            checks: HashMap::new(),
             stats: Stats::default(),
         }
     }
 
-    fn block(&mut self, cpu: &mut Cpu, pc: u32) -> Option<extern "C" fn() -> u32> {
+    fn block(&mut self, cpu: &mut Cpu, pc: u32) -> Option<extern "C" fn(u32) -> u32> {
         let generation = cpu.bus.translation_generation();
         if generation != self.generation {
             // Flash, its mapping or the write guards changed: every
             // translation may be stale.
             self.slots.fill((u32::MAX, Slot::Unavailable));
+            self.chain.fill([u32::MAX, 0]);
             self.generation = generation;
         }
         let index = (pc >> 1) as usize & (SLOTS - 1);
@@ -173,18 +185,23 @@ impl Jit {
             }
             Slot::Counting(_) => {}
         }
-        let compiled = cpu.translate_block(pc).and_then(|block| {
+        let chain = self
+            .chaining
+            .then(|| (self.chain.as_ptr() as usize as u32, SLOTS as u32 - 1));
+        let compiled = cpu.translate_block(pc, chain).and_then(|block| {
             // SAFETY: the host reads `length` bytes from linear memory.
             let index = unsafe { jit_compile(block.wasm.as_ptr(), block.wasm.len()) };
             // SAFETY: a nonnegative result is the table index of a function
-            // of type () -> i32; on wasm32 function pointers are table indices.
+            // of type (i32) -> i32; on wasm32 function pointers are table
+            // indices.
             (index > 0).then(|| unsafe {
-                std::mem::transmute::<usize, extern "C" fn() -> u32>(index as usize)
+                std::mem::transmute::<usize, extern "C" fn(u32) -> u32>(index as usize)
             })
         });
         self.slots[index].1 = match compiled {
             Some(function) => {
                 self.stats.compiled += 1;
+                self.chain[index] = [pc, function as usize as u32];
                 Slot::Ready(function)
             }
             None => {
@@ -203,13 +220,20 @@ impl Jit {
         cpu.step_many_with(budget, self).map_err(|error| error.to_string())
     }
 
-    fn call(cpu: &mut Cpu, function: extern "C" fn() -> u32) -> Result<u32, String> {
+    /// Whether to verify this call: the first few calls entering at `pc`.
+    fn sample(&mut self, pc: u32) -> bool {
+        let checks = self.checks.entry(pc).or_default();
+        *checks += 1;
+        *checks <= 8
+    }
+
+    fn call(cpu: &mut Cpu, function: extern "C" fn(u32) -> u32) -> Result<u32, String> {
         // SAFETY: as in `run`.
         unsafe {
             let exec = &mut *std::ptr::addr_of_mut!(EXEC);
             exec.cpu = cpu as *mut Cpu;
             exec.pc = u32::MAX;
-            let executed = function();
+            let executed = function(0);
             exec.cpu = std::ptr::null_mut();
             if let Some(fault) = exec.fault.take() {
                 return Err(fault);
@@ -224,7 +248,7 @@ impl Jit {
         &mut self,
         cpu: &mut Cpu,
         pc: u32,
-        function: extern "C" fn() -> u32,
+        function: extern "C" fn(u32) -> u32,
     ) -> Result<u32, String> {
         let before = cpu.block_state();
         let ram_before = cpu.bus.ram().to_vec();

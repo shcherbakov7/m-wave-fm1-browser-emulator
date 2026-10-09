@@ -129,7 +129,7 @@ addEventListener("keyup", (event) => {
 addEventListener("blur", releaseAll);
 
 // --- Emulator worker -------------------------------------------------------
-const worker = new Worker("emulator-worker.js");
+const worker = new Worker("emulator-worker.js", { type: "module" });
 let current = null; // { name, bytes }
 let audio = null;   // { context, node }
 
@@ -141,13 +141,11 @@ worker.onmessage = ({ data }) => {
       $("drop-hint").classList.add("hidden");
       $("pause").disabled = $("restart").disabled = false;
       $("pause").textContent = "Пауза";
-      audio?.node.port.postMessage("clear");
       break;
     case "lcd":
       lcdImage.data.set(data.frame);
       lcd.putImageData(lcdImage, 0, 0);
       break;
-    case "audio": audio?.node.port.postMessage(data.samples, [data.samples.buffer]); break;
     case "serial": appendSerial(data.text); break;
     case "serial-busy": appendSerial("\n[консоль занята, повторите]\n"); break;
     case "status": showStatus(data.info); break;
@@ -167,6 +165,7 @@ function showStatus(info) {
   if (!info.loaded) return;
   const pct = info.realtime * 100;
   $("speed").textContent = info.realtime ? `${pct < 10 ? pct.toFixed(1) : pct.toFixed(0)}% реального` : "—";
+  $("speed").title = `Загрузка эмулятора: ${(info.load * 100).toFixed(0)}% одного ядра`;
   $("steps").textContent = `${(info.steps / 1e6).toFixed(0)} M`;
   $("guest-time").textContent = `${info.guestSeconds.toFixed(1)} с`;
   $("irqs").textContent = info.irqs.toLocaleString("ru");
@@ -233,6 +232,10 @@ $("sound").addEventListener("click", async () => {
     await context.audioWorklet.addModule("audio-worklet.js");
     const node = new AudioWorkletNode(context, "fm1-output", { outputChannelCount: [2] });
     node.connect(context.destination);
+    // The worker feeds the worklet directly, bypassing this thread.
+    const { port1, port2 } = new MessageChannel();
+    node.port.postMessage({ port: port1 }, [port1]);
+    worker.postMessage({ type: "audio-port", port: port2 }, [port2]);
     audio = { context, node };
     $("sound").textContent = "🔊 Звук";
   } else if (audio.context.state === "running") {

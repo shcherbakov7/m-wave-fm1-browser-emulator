@@ -12,6 +12,8 @@ use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
 mod jit;
 
+/// Guest oscillator ticks per second.
+const OSCILLATOR_HZ: f64 = 24e6;
 /// Guest time (24 MHz oscillator ticks, here 100 ms) a key stays closed after
 /// a press, so that even a short click lasts long enough for firmware
 /// scanning and debounce however slowly the emulator runs.
@@ -58,7 +60,15 @@ impl Machine {
         let mut cpu = Cpu::new(firmware.bus()?, firmware.entry);
         // Application handoff: the SPL's boot-parameter pointer in r0.
         cpu.r[0] = 0x01c7_fe08;
-        *self = Self::new();
+        let previous = std::mem::replace(self, Self::new());
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Host settings outlive the machine.
+            self.jit.enabled = previous.jit.enabled;
+            self.jit.verify = previous.jit.verify;
+            self.jit.chaining = previous.jit.chaining;
+        }
+        drop(previous);
         self.cpu = Some(cpu);
         Ok(())
     }
@@ -78,6 +88,12 @@ impl Machine {
     }
 
     fn run(&mut self, steps: u32) -> i32 {
+        self.run_until(u64::MAX, steps, 1 << 20)
+    }
+
+    /// Run up to `steps` steps, stopping early once guest time reaches
+    /// `target` oscillator ticks (checked every `chunk` steps).
+    fn run_until(&mut self, target: u64, steps: u32, chunk: u32) -> i32 {
         if self.fault.is_some() {
             return 1;
         }
@@ -87,8 +103,11 @@ impl Machine {
         // Re-check key release timing at a bounded granularity.
         let mut remaining = steps;
         while remaining > 0 {
-            let chunk = remaining.min(1 << 20);
             let cpu = self.cpu.as_mut().unwrap();
+            if cpu.bus.oscillator_ticks >= target {
+                break;
+            }
+            let chunk = remaining.min(chunk);
             #[cfg(target_arch = "wasm32")]
             let result = self.jit.run(cpu, chunk as u64);
             #[cfg(not(target_arch = "wasm32"))]
@@ -182,6 +201,34 @@ pub extern "C" fn fm1_run(steps: u32) -> i32 {
     })
 }
 
+/// Run until guest time reaches `seconds` or `max_steps` steps have run,
+/// whichever comes first. Hosts pace emulation against their clock with it.
+/// Returns as `fm1_run`.
+#[no_mangle]
+pub extern "C" fn fm1_run_until(seconds: f64, max_steps: u32) -> i32 {
+    with(|m| {
+        let target = (seconds.max(0.0) * OSCILLATOR_HZ) as u64;
+        let status = m.run_until(target, max_steps, 8192);
+        if status == 1 {
+            let fault = m.fault.clone().unwrap_or_default();
+            m.set_message(&fault);
+        }
+        status
+    })
+}
+
+/// Guest time in seconds since boot (0 when nothing is loaded).
+#[no_mangle]
+pub extern "C" fn fm1_guest_seconds() -> f64 {
+    with(|m| m.cpu.as_ref().map_or(0.0, |cpu| cpu.bus.oscillator_ticks as f64 / OSCILLATOR_HZ))
+}
+
+/// Guest steps executed since boot.
+#[no_mangle]
+pub extern "C" fn fm1_steps() -> f64 {
+    with(|m| m.cpu.as_ref().map_or(0.0, |cpu| cpu.steps as f64))
+}
+
 /// Press (1) or release (0) a panel control (see `PANEL_KEYMAP`).
 #[no_mangle]
 pub extern "C" fn fm1_key(id: u32, down: u32) {
@@ -272,9 +319,10 @@ pub extern "C" fn fm1_status() -> usize {
             Some(cpu) => {
                 #[cfg(target_arch = "wasm32")]
                 let jit = format!(
-                    "{{\"enabled\":{},\"compiled\":{},\"failed\":{},\"translatedSteps\":{},\
+                    "{{\"enabled\":{},\"chaining\":{},\"compiled\":{},\"failed\":{},\"translatedSteps\":{},\
                      \"blockCalls\":{},\"execCalls\":{},\"batchedSteps\":{}}}",
                     m.jit.enabled,
+                    m.jit.chaining,
                     m.jit.stats.compiled,
                     m.jit.stats.failed,
                     m.jit.stats.translated_steps,
@@ -289,7 +337,7 @@ pub extern "C" fn fm1_status() -> usize {
                 "{{\"loaded\":true,\"steps\":{},\"guestSeconds\":{},\"irqs\":{},\"lcdPixels\":{},\
                  \"visible\":{},\"audioFrames\":{},\"watchdogFeeds\":{},\"jit\":{},\"fault\":{}}}",
                 cpu.steps,
-                cpu.bus.oscillator_ticks as f64 / 24e6,
+                cpu.bus.oscillator_ticks as f64 / OSCILLATOR_HZ,
                 cpu.irq_entries,
                 cpu.bus.lcd.pixels_written,
                 cpu.bus.screen_visible(),
@@ -365,6 +413,16 @@ pub extern "C" fn fm1_profile_exec(start: u32) -> usize {
 }
 
 /// Turn per-block verification against the interpreter on (1) or off (0).
+/// Let translated blocks call each other directly (the host must support
+/// WebAssembly tail calls). Takes effect for blocks translated afterwards.
+#[no_mangle]
+pub extern "C" fn fm1_set_jit_chaining(enabled: u32) {
+    #[cfg(target_arch = "wasm32")]
+    with(|m| m.jit.chaining = enabled != 0);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = enabled;
+}
+
 #[no_mangle]
 pub extern "C" fn fm1_set_jit_verify(enabled: u32) {
     with(|_m| {

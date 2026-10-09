@@ -151,6 +151,13 @@ impl Body {
         self.bytes.push(0x0f);
         self
     }
+    /// Tail call through `table` with a function of type `ty`.
+    pub(crate) fn return_call_indirect(&mut self, ty: u32, table: u32) -> &mut Self {
+        self.bytes.push(0x13);
+        unsigned_leb(&mut self.bytes, ty);
+        unsigned_leb(&mut self.bytes, table);
+        self
+    }
     pub(crate) fn call(&mut self, function: u32) -> &mut Self {
         self.bytes.push(0x10);
         unsigned_leb(&mut self.bytes, function);
@@ -169,14 +176,22 @@ fn name(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(text.as_bytes());
 }
 
-/// A module importing `env.memory`, `env.exec: () -> i32` (function 0) and
-/// `env.exec_pred: (i32, i32) -> i32` (function 1), exporting one function
-/// `b: () -> i32` with `locals` i32 locals and the given body.
-pub(crate) fn module(body: &Body, locals: u32) -> Vec<u8> {
+/// Type of block functions: (instructions so far) -> instructions run.
+pub(crate) const BLOCK_TYPE: u32 = 2;
+
+/// A module importing `env.memory`, `env.exec: () -> i32` (function 0),
+/// `env.exec_pred: (i32, i32) -> i32` (function 1) and, with `table`, the
+/// function table `env.table`; exporting one function `b: (i32) -> i32`
+/// with `locals` further i32 locals and the given body.
+pub(crate) fn module(body: &Body, locals: u32, table: bool) -> Vec<u8> {
     let mut out = b"\0asm\x01\0\0\0".to_vec();
-    // Type 0: () -> i32; type 1: (i32, i32) -> i32.
-    section(&mut out, 1, &[2, 0x60, 0, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 1, 0x7f]);
-    let mut imports = vec![3];
+    // Type 0: () -> i32; type 1: (i32, i32) -> i32; type 2: (i32) -> i32.
+    section(
+        &mut out,
+        1,
+        &[3, 0x60, 0, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 1, 0x7f, 1, 0x7f],
+    );
+    let mut imports = vec![3 + table as u8];
     name(&mut imports, "env");
     name(&mut imports, "memory");
     imports.extend_from_slice(&[0x02, 0x00, 0x01]); // memory, min 1 page
@@ -186,8 +201,13 @@ pub(crate) fn module(body: &Body, locals: u32) -> Vec<u8> {
     name(&mut imports, "env");
     name(&mut imports, "exec_pred");
     imports.extend_from_slice(&[0x00, 0x01]);
+    if table {
+        name(&mut imports, "env");
+        name(&mut imports, "table");
+        imports.extend_from_slice(&[0x01, 0x70, 0x00, 0x00]); // funcref, min 0
+    }
     section(&mut out, 2, &imports);
-    section(&mut out, 3, &[1, 0]);
+    section(&mut out, 3, &[1, BLOCK_TYPE as u8]);
     let mut exports = vec![1];
     name(&mut exports, "b");
     exports.extend_from_slice(&[0x00, 0x02]); // function 2, after the imports

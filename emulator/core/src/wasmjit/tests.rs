@@ -5,13 +5,18 @@
 use super::*;
 use crate::{bus::Bus, cpu::Cpu};
 use std::collections::BTreeMap;
-use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module, Store};
+use wasmi::{
+    Caller, Engine, Linker, Memory, MemoryType, Module, Nullable, Ref, RefType, Store, Table,
+    TableType,
+};
 
 const STATE_R: u32 = 0x100;
 const STATE_SR: u32 = 0x140;
 const STATE_PC: u32 = 0x180;
 const STATE_IRQ: u32 = 0x184;
 const STATE_WRITES: u32 = 0x188;
+/// One-entry chain table (see `Layout::chain`).
+const STATE_CHAIN: u32 = 0x1c0;
 const STATE_RAM: u32 = 0x10000;
 const STATE_XIP: u32 = 0x90000;
 
@@ -25,6 +30,7 @@ fn layout(cpu: &Cpu) -> Layout {
         interrupts: STATE_IRQ,
         windows: cpu.bus.guard_windows(),
         xip: vec![(XIP, XIP + cpu.bus.flash.len() as u32, STATE_XIP)],
+        chain: None,
     }
 }
 
@@ -153,18 +159,32 @@ fn compare(code: &[u16], rng: &mut Rng) -> (&'static str, bool) {
 /// Translate up to `limit` instructions; the interpreter then runs as many
 /// instructions as the block reports.
 fn compare_block(code: &[u16], rng: &mut Rng, limit: u32) -> (&'static str, bool) {
-    compare_guarded(code, rng, limit, None)
+    compare_guarded(code, rng, limit, None, false)
 }
 
-/// As `compare_block`, optionally with one enabled write-protection window.
+/// Flag updates the translator skipped as dead.
+pub(super) static SKIPPED_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Most instructions one chained call has run (see the chaining test).
+static LONGEST_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// As `compare_block`, optionally with one enabled write-protection window
+/// and with the block chained to itself at XIP.
 fn compare_guarded(
     code: &[u16],
     rng: &mut Rng,
     limit: u32,
     window: Option<(u32, u32)>,
+    chained: bool,
 ) -> (&'static str, bool) {
     let mut reference = cpu_with(code);
     random_state(rng, &mut reference);
+    if chained {
+        // Returns and register jumps back to the start chain into the
+        // block itself (the chain table holds it at XIP).
+        reference.sr[3] = XIP;
+        reference.r[rng.below(16) as usize] = XIP;
+    }
     let mut host_cpu = cpu_with(code);
     if let Some((low, high)) = window {
         for cpu in [&mut reference, &mut host_cpu] {
@@ -183,10 +203,14 @@ fn compare_guarded(
     host_cpu.sr = reference.sr;
     host_cpu.interrupts_enabled = reference.interrupts_enabled;
 
+    let mut block_layout = layout(&reference);
+    if chained {
+        block_layout.chain = Some((STATE_CHAIN, 0));
+    }
     let block = translate_limited(
         &reference.bus,
         &mut crate::decode::Cache::new(),
-        &layout(&reference),
+        &block_layout,
         XIP,
         limit,
         if limit == 1 { 1 } else { 6 },
@@ -212,9 +236,20 @@ fn compare_guarded(
     {
         let (data, host) = memory.data_and_store_mut(&mut store);
         to_wasm(data, &host.cpu);
+        put(data, STATE_CHAIN, XIP);
+        put(data, STATE_CHAIN + 4, 0);
     }
     let mut linker = Linker::<Host>::new(&engine);
     linker.define("env", "memory", memory).unwrap();
+    let table = Table::new(
+        &mut store,
+        TableType::new(RefType::Func, 1, None),
+        Ref::Func(Nullable::Null),
+    )
+    .unwrap();
+    if chained {
+        linker.define("env", "table", table).unwrap();
+    }
     linker
         .func_wrap("env", "exec", |mut caller: Caller<'_, Host>| -> i32 {
             let memory = caller.data().memory.unwrap();
@@ -255,8 +290,13 @@ fn compare_guarded(
         .unwrap();
     let module = Module::new(&engine, &block.wasm).unwrap();
     let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&store, "b").unwrap();
-    let count = run.call(&mut store, ()).unwrap();
+    let function = instance.get_func(&store, "b").unwrap();
+    table.set(&mut store, 0, Ref::Func(function.into())).unwrap();
+    let run = instance.get_typed_func::<i32, i32>(&store, "b").unwrap();
+    let count = run.call(&mut store, 0).unwrap();
+    if chained {
+        LONGEST_RUN.fetch_max(count as u32, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let mut reference_result = Ok((0, "empty"));
     for _ in 0..count.max(1) {
@@ -394,6 +434,26 @@ fn random_sequences_match_the_interpreter() {
         }
         compare_block(&code, &mut rng, 8);
     }
+    // Some flag updates were found dead and skipped.
+    assert!(SKIPPED_FLAGS.load(std::sync::atomic::Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn chained_sequences_match_the_interpreter() {
+    let mut rng = Rng(0xc4a1_7ed5_0001);
+    let mut chained = 0;
+    for _ in 0..8_000 {
+        let mut code = Vec::new();
+        for _ in 0..8 {
+            code.extend_from_slice(&random_code(&mut rng));
+        }
+        let before = LONGEST_RUN.load(std::sync::atomic::Ordering::Relaxed);
+        compare_guarded(&code, &mut rng, 8, None, true);
+        chained += (LONGEST_RUN.load(std::sync::atomic::Ordering::Relaxed) > before) as u32;
+    }
+    // Some calls must have gone round through the chain table (a block
+    // here has at most 8 instructions per pass).
+    assert!(LONGEST_RUN.load(std::sync::atomic::Ordering::Relaxed) > 8 * 6, "{chained}");
 }
 
 #[test]
@@ -404,7 +464,7 @@ fn stores_into_a_write_protection_window_fault_like_the_interpreter() {
         // A window around the pointers random_state hands out.
         let low = RAM + 0x1000 + (rng.below(0x7c000) & !3);
         let high = low + rng.below(0x8000);
-        compare_guarded(&code, &mut rng, 1, Some((low, high)));
+        compare_guarded(&code, &mut rng, 1, Some((low, high)), false);
     }
 }
 
@@ -482,8 +542,8 @@ fn firmware_instructions_match_the_interpreter() {
             .unwrap();
         let module = Module::new(&engine, &block.wasm).unwrap();
         let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
-        let run = instance.get_typed_func::<(), i32>(&store, "b").unwrap();
-        let count = run.call(&mut store, ()).unwrap();
+        let run = instance.get_typed_func::<i32, i32>(&store, "b").unwrap();
+        let count = run.call(&mut store, 0).unwrap();
         let (_, name) = cpu.execute_current().unwrap();
         if store.data().exec_calls != 0 || count != 1 {
             continue;

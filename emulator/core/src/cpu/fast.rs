@@ -300,9 +300,15 @@ impl Cpu {
         self.idle
     }
 
-    /// Translate the block at `pc` for state at the addresses of this CPU.
-    pub fn translate_block(&mut self, pc: u32) -> Option<crate::wasmjit::Block> {
-        let layout = self.jit_layout();
+    /// Translate the block at `pc` for state at the addresses of this CPU,
+    /// chaining through `chain` (see `wasmjit::Layout::chain`) when given.
+    pub fn translate_block(
+        &mut self,
+        pc: u32,
+        chain: Option<(u32, u32)>,
+    ) -> Option<crate::wasmjit::Block> {
+        let mut layout = self.jit_layout();
+        layout.chain = chain;
         crate::wasmjit::translate(&self.bus, &mut self.decode, &layout, pc)
     }
 
@@ -324,6 +330,7 @@ impl Cpu {
                 .into_iter()
                 .map(|(start, end, host)| (start, end, address(host)))
                 .collect(),
+            chain: None,
         }
     }
 }

@@ -5,7 +5,7 @@ import { deflateSync, crc32 } from "node:zlib";
 import { instantiateFm1 } from "../web/fm1-host.js";
 
 const [wasmPath, firmwarePath, stepsArg = "100000000", pngPath] = process.argv.slice(2);
-const x = await instantiateFm1(readFileSync(wasmPath));
+const x = await instantiateFm1(readFileSync(wasmPath), { chaining: !process.env.NOCHAIN });
 const mem = () => new Uint8Array(x.memory.buffer);
 const message = () => new TextDecoder().decode(mem().slice(x.fm1_message_ptr(), x.fm1_message_ptr() + x.fm1_message_len()));
 
@@ -20,11 +20,17 @@ if (process.env.PROFILE_EXEC) x.fm1_profile_exec(1);
 const total = Number(stepsArg);
 const start = performance.now();
 let status = 0;
-for (let done = 0; done < total && status === 0; done += 4_000_000) status = x.fm1_run(Math.min(4_000_000, total - done));
-const seconds = (performance.now() - start) / 1000;
+let half = null; // { time, guest } once half the steps ran: steady-state speed excludes warm-up
+for (let done = 0; done < total && status === 0; done += 4_000_000) {
+  if (!half && done >= total / 2) half = { time: performance.now(), guest: x.fm1_guest_seconds() };
+  status = x.fm1_run(Math.min(4_000_000, total - done));
+}
+const end = performance.now();
+const seconds = (end - start) / 1000;
 x.fm1_status();
 const info = JSON.parse(message());
-console.log(JSON.stringify({ status, seconds: +seconds.toFixed(2), mStepsPerSec: +(info.steps / 1e6 / seconds).toFixed(1), realtime: +(info.guestSeconds / seconds).toFixed(3), ...info }));
+console.log(JSON.stringify({ status, seconds: +seconds.toFixed(2), mStepsPerSec: +(info.steps / 1e6 / seconds).toFixed(1), realtime: +(info.guestSeconds / seconds).toFixed(3),
+  steadyRealtime: half ? +((info.guestSeconds - half.guest) * 1000 / (end - half.time)).toFixed(3) : null, ...info }));
 
 if (process.env.PROFILE_EXEC) { x.fm1_profile_exec(0); console.log(message()); }
 if (pngPath) {
