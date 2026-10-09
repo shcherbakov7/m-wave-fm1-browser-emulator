@@ -40,6 +40,8 @@ jobs:
           cp web/*.html web/*.css web/*.js web/fm1.wasm _site/
           cp -r web/firmware _site/
           cp LICENSE _site/
+          # Stamp the build so browsers never mix cached files of two builds.
+          sed -i "s/__BUILD__/${GITHUB_SHA::8}/g" _site/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

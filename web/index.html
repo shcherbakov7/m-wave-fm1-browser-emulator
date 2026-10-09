@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>FM-1 Emulator</title>
   <meta name="description" content="Браузерный эмулятор M-VAVE FM-1: запускает немодифицированные прошивки .fwsc">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=__BUILD__">
 </head>
 <body>
   <header class="bar">
@@ -32,6 +32,10 @@
     </section>
 
     <section class="info">
+      <section class="firmware-card" aria-labelledby="firmware-title">
+        <h2 id="firmware-title">Прошивки</h2>
+        <div id="firmware-list" class="firmware-list"></div>
+      </section>
       <div id="state" class="state">Нет прошивки</div>
       <div id="about" class="about" hidden></div>
       <dl class="stats">
@@ -63,6 +67,6 @@
     GPL-3.0 · Ядро основано на <a href="https://github.com/simonjohansson/fm1-emulator">fm1-emulator</a> ·
     Прошивки не входят в комплект, загружайте свои.
   </footer>
-  <script src="app.js" type="module"></script>
+  <script src="app.js?v=__BUILD__" type="module"></script>
 </body>
 </html>

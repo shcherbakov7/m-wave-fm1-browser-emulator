@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Page controller: device panel, input, firmware loading, audio and status.
-import { createPanel, ID } from "./panel.js";
+// The build stamps ?v=<commit> on app.js; every file it loads carries the
+// same stamp, so a new deployment is never mixed with cached old files.
+const VERSION = new URL(import.meta.url).search;
+const { createPanel, ID } = await import(`./panel.js${VERSION}`);
 
 // Computer keyboard → panel control id. The 27-key keyboard starts on F.
 const KEYBOARD = new Map();
@@ -47,7 +50,7 @@ addEventListener("keyup", (event) => {
 addEventListener("blur", releaseAll);
 
 // --- Emulator worker -------------------------------------------------------
-const worker = new Worker("emulator-worker.js", { type: "module" });
+const worker = new Worker(`emulator-worker.js${VERSION}`, { type: "module" });
 let current = null; // { name, bytes }
 let audio = null;   // { context, node }
 
@@ -72,7 +75,7 @@ worker.onmessage = ({ data }) => {
     case "error": setState(`Ошибка${data.name ? ` (${data.name})` : ""}: ${data.message}`, "fault"); break;
   }
 };
-worker.postMessage({ type: "init", wasmUrl: new URL("fm1.wasm", location.href).href });
+worker.postMessage({ type: "init", wasmUrl: new URL(`fm1.wasm${VERSION}`, location.href).href });
 
 function setState(text, kind = "") {
   const state = $("state");
@@ -113,6 +116,8 @@ function boot(name, bytes, entry = null) {
   const url = new URL(location.href);
   if (entry) url.searchParams.set("fw", entry.id); else url.searchParams.delete("fw");
   history.replaceState(null, "", url);
+  for (const element of document.querySelectorAll(".fw.active")) element.classList.remove("active");
+  refreshRecent();
 }
 
 async function openFile(file) {
@@ -207,7 +212,7 @@ $("serial-form").addEventListener("submit", (event) => {
 $("sound").addEventListener("click", async () => {
   if (!audio) {
     const context = new AudioContext({ sampleRate: 44100 });
-    await context.audioWorklet.addModule("audio-worklet.js");
+    await context.audioWorklet.addModule(`audio-worklet.js${VERSION}`);
     const node = new AudioWorkletNode(context, "fm1-output", { outputChannelCount: [2] });
     node.connect(context.destination);
     // The worker feeds the worklet directly, bypassing this thread.
@@ -258,6 +263,32 @@ async function refreshRecent() {
   if (open.length) groups.push(group("Открытые прошивки", open.map((e) => new Option(`${e.name} ${e.version} — ${e.author}${mark(e)}`, `c:${e.id}`))));
   if (saved.length) groups.push(group("Ваши файлы (недавние)", saved.map((e) => new Option(e.name, `r:${e.name}`))));
   $("firmware").replaceChildren(...groups);
+  showFirmwareList(saved);
+}
+
+/** The firmware card: a button per firmware, easy to tap on a phone. */
+function showFirmwareList(saved = []) {
+  const button = (title, detail, onClick, extra = "") => {
+    const element = document.createElement("button");
+    element.type = "button";
+    element.className = `fw ${extra}`;
+    element.innerHTML = `<span>${escape(title)}</span><small>${escape(detail)}</small>`;
+    element.addEventListener("click", onClick);
+    return element;
+  };
+  const items = catalog.map((entry) => {
+    const active = current?.entry?.id === entry.id ? "active" : "";
+    const warn = entry.check && !entry.check.ok ? " ⚠" : "";
+    return button(`${entry.name}${warn}`, `${entry.version} · ${entry.author}`, () => bootCatalog(entry), active);
+  });
+  for (const file of saved.slice(0, 4)) {
+    items.push(button(file.name, "ваш файл", async () => {
+      const entry = await database("readonly", (store) => store.get(file.name));
+      if (entry) boot(entry.name, entry.bytes);
+    }, current?.name === file.name ? "active" : ""));
+  }
+  items.push(button("Свой файл…", ".fwsc с устройства", () => $("file").click(), "own"));
+  $("firmware-list").replaceChildren(...items);
 }
 
 async function restoreLast() {
