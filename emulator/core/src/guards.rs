@@ -70,8 +70,9 @@ impl Guards {
             .collect();
         Some(Ok(()))
     }
-    pub(crate) fn active(&self) -> bool {
-        !self.windows.is_empty()
+    /// Enabled write-protection windows as inclusive `(low, high)`.
+    pub(crate) fn windows(&self) -> &[(u32, u32)] {
+        &self.windows
     }
     pub fn check_write(&self, a: u32, size: usize) -> Result<(), &'static str> {
         for &(low, high) in &self.windows {

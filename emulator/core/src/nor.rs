@@ -105,6 +105,46 @@ impl Nor {
         Some(Ok(little_endian(bytes)))
     }
 
+    /// Side-effect-free host views of XIP for guest `[start, end)`, as
+    /// `(guest_start, guest_end, host pointer for guest_start)`, matching
+    /// `xip`: plain bytes, the decrypted application, or both around the
+    /// plain window. Empty while XIP is unavailable.
+    pub(crate) fn xip_segments(&self, start: u32, end: u32) -> Vec<(u32, u32, *const u8)> {
+        if self.busy_ticks != 0 || !self.xip_active() || start >= end {
+            return Vec::new();
+        }
+        let base = self.regs[3] as i64 - 0x0200_0000;
+        // Guest [lo, hi) read from `bytes`, whose index for guest a is a + shift.
+        let view = |lo: u32, hi: u32, bytes: &[u8], shift: i64| -> Option<(u32, u32, *const u8)> {
+            let first = (lo as i64).max(-shift);
+            let last = (hi as i64).min(bytes.len() as i64 - shift);
+            (first < last).then(|| {
+                (
+                    first as u32,
+                    last as u32,
+                    bytes[(first + shift) as usize..].as_ptr(),
+                )
+            })
+        };
+        let control = self.regs[4];
+        let decoded = |lo, hi| {
+            self.decoded
+                .as_deref()
+                .and_then(|bytes| view(lo, hi, bytes, base - 0x4000))
+        };
+        let plain = |lo, hi| view(lo, hi, &self.bytes, base);
+        let segments = if control & 1 == 0 {
+            vec![plain(start, end)]
+        } else if control & 2 == 0 {
+            vec![decoded(start, end)]
+        } else {
+            let low = start.max(self.regs[7]).min(end);
+            let high = end.min(self.regs[6].saturating_add(1)).max(low);
+            vec![decoded(start, low), plain(low, high), decoded(high, end)]
+        };
+        segments.into_iter().flatten().collect()
+    }
+
     pub fn read(&self, a: u32) -> Option<u32> {
         Self::register_index(a).map(|index| {
             let value = self.regs[index];

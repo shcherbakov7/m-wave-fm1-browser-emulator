@@ -56,6 +56,8 @@ pub(crate) const I32_SHR_U: u8 = 0x76;
 pub(crate) const I32_ROTR: u8 = 0x78;
 pub(crate) const I32_EXTEND8_S: u8 = 0xc0;
 pub(crate) const I32_EXTEND16_S: u8 = 0xc1;
+pub(crate) const I32_CLZ: u8 = 0x67;
+pub(crate) const I32_ROTL: u8 = 0x77;
 pub(crate) const SELECT: u8 = 0x1b;
 pub(crate) const DROP: u8 = 0x1a;
 
@@ -117,6 +119,34 @@ impl Body {
         self.bytes.push(0x0b);
         self
     }
+    pub(crate) fn br(&mut self, depth: u32) -> &mut Self {
+        self.bytes.push(0x0c);
+        unsigned_leb(&mut self.bytes, depth);
+        self
+    }
+    /// `br_table` over `targets` with `default`.
+    pub(crate) fn br_table(&mut self, targets: &[u32], default: u32) -> &mut Self {
+        self.bytes.push(0x0e);
+        unsigned_leb(&mut self.bytes, targets.len() as u32);
+        for &target in targets {
+            unsigned_leb(&mut self.bytes, target);
+        }
+        unsigned_leb(&mut self.bytes, default);
+        self
+    }
+    /// `block` / `loop` with no result.
+    pub(crate) fn block(&mut self) -> &mut Self {
+        self.bytes.extend_from_slice(&[0x02, 0x40]);
+        self
+    }
+    pub(crate) fn loop_(&mut self) -> &mut Self {
+        self.bytes.extend_from_slice(&[0x03, 0x40]);
+        self
+    }
+    pub(crate) fn unreachable(&mut self) -> &mut Self {
+        self.bytes.push(0x00);
+        self
+    }
     pub(crate) fn ret(&mut self) -> &mut Self {
         self.bytes.push(0x0f);
         self
@@ -139,24 +169,28 @@ fn name(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(text.as_bytes());
 }
 
-/// A module importing `env.memory` and `env.exec: () -> i32`, exporting one
-/// function `b: () -> i32` with `locals` i32 locals and the given body.
+/// A module importing `env.memory`, `env.exec: () -> i32` (function 0) and
+/// `env.exec_pred: (i32, i32) -> i32` (function 1), exporting one function
+/// `b: () -> i32` with `locals` i32 locals and the given body.
 pub(crate) fn module(body: &Body, locals: u32) -> Vec<u8> {
     let mut out = b"\0asm\x01\0\0\0".to_vec();
-    // Type 0: () -> i32.
-    section(&mut out, 1, &[1, 0x60, 0, 1, 0x7f]);
-    let mut imports = vec![2];
+    // Type 0: () -> i32; type 1: (i32, i32) -> i32.
+    section(&mut out, 1, &[2, 0x60, 0, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 1, 0x7f]);
+    let mut imports = vec![3];
     name(&mut imports, "env");
     name(&mut imports, "memory");
     imports.extend_from_slice(&[0x02, 0x00, 0x01]); // memory, min 1 page
     name(&mut imports, "env");
     name(&mut imports, "exec");
-    imports.extend_from_slice(&[0x00, 0x00]); // function of type 0
+    imports.extend_from_slice(&[0x00, 0x00]);
+    name(&mut imports, "env");
+    name(&mut imports, "exec_pred");
+    imports.extend_from_slice(&[0x00, 0x01]);
     section(&mut out, 2, &imports);
     section(&mut out, 3, &[1, 0]);
     let mut exports = vec![1];
     name(&mut exports, "b");
-    exports.extend_from_slice(&[0x00, 0x01]); // function index 1 (after the import)
+    exports.extend_from_slice(&[0x00, 0x02]); // function 2, after the imports
     section(&mut out, 7, &exports);
     let mut function = Vec::new();
     if locals == 0 {

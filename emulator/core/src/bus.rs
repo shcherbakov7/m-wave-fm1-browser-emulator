@@ -112,12 +112,15 @@ pub struct Bus {
     /// Guest writes of any kind (wrapping), for recognizing side-effect-free
     /// loops. Translated code increments it in place.
     pub(crate) writes: u32,
-    /// Nonzero while a CPU write-protection window is enabled; translated
-    /// code reads it in place.
-    pub(crate) guard_flag: u32,
-    /// Accesses that reached device registers (not SRAM or XIP); batches
-    /// end after one so devices are brought up to date.
+    /// Bumped when the write-protection windows change; translated code has
+    /// them built in.
+    guard_generation: u32,
+    /// Accesses that reached time-dependent device registers (not SRAM,
+    /// XIP or GPIO ports); batches end after one so devices are brought up
+    /// to date first.
     pub(crate) device_accesses: std::cell::Cell<u64>,
+    /// When set, device-register accesses counted by address (diagnostics).
+    pub device_log: std::cell::RefCell<Option<std::collections::HashMap<u32, u64>>>,
     /// Direct-mapped cache of XIP instruction halfwords, tagged with the
     /// address and the NOR generation in force when they were read.
     code_cache: Box<[CodeEntry]>,
@@ -170,8 +173,9 @@ impl Bus {
             oscillator_ticks: 0,
             timer_polls: Default::default(),
             writes: 0,
-            guard_flag: 0,
+            guard_generation: 0,
             device_accesses: Default::default(),
+            device_log: Default::default(),
             code_cache: vec![
                 CodeEntry {
                     address: u32::MAX,
@@ -213,6 +217,15 @@ impl Bus {
         Ok(())
     }
 
+    /// Registers whose behavior does not depend on guest time: the GPIO
+    /// ports (outputs, directions, pulls, and inputs from the key matrix,
+    /// which only the host changes between runs), except port D, whose PD0
+    /// selects the NOR flash and so starts timed flash commands.
+    fn timeless(address: u32) -> bool {
+        let gpio = crate::gpio::GPIO;
+        (gpio..gpio + 0xc0).contains(&address) || (gpio + 0x100..gpio + 0x200).contains(&address)
+    }
+
     fn offset(address: u32, size: usize, base: u32, length: usize) -> Option<usize> {
         let offset = address.checked_sub(base)? as usize;
         (offset.checked_add(size)? <= length).then_some(offset)
@@ -248,7 +261,22 @@ impl Bus {
         } else if let Some(offset) = Self::offset(address, size, RAM, self.ram.len()) {
             &self.ram[offset..offset + size]
         } else {
-            self.device_accesses.set(self.device_accesses.get() + 1);
+            if !Self::timeless(address) {
+                self.device_accesses.set(self.device_accesses.get() + 1);
+            }
+            if let Some(log) = self.device_log.borrow_mut().as_mut() {
+                *log.entry(address).or_default() += 1;
+            }
+            // Short path for the hottest registers (TIMER4/5, GPIO), which no
+            // other device in the chain below claims.
+            if (0x10800..0x10a00).contains(&address) || Self::timeless(address) {
+                if address == crate::devices::TIMER4 + 4 || address == crate::devices::TIMER5 + 4 {
+                    self.timer_polls.set(self.timer_polls.get() + 1);
+                }
+                if let Some(value) = self.devices.read(address, size) {
+                    return value.map_err(|reason| Self::fault(address, size, operation, reason));
+                }
+            }
             if let Some(value) = self.shift_spi.read(address & !3) {
                 return if size == 4 {
                     Ok(value)
@@ -393,7 +421,20 @@ impl Bus {
             self.ram[offset..offset + size].copy_from_slice(&value.to_le_bytes()[..size]);
             return Ok(());
         }
-        self.device_accesses.set(self.device_accesses.get() + 1);
+        if !Self::timeless(address) {
+            self.device_accesses.set(self.device_accesses.get() + 1);
+        }
+        if let Some(log) = self.device_log.borrow_mut().as_mut() {
+            *log.entry(address | 1).or_default() += 1; // odd: write
+        }
+        if Self::timeless(address) {
+            self.guards
+                .check_write(address, size)
+                .map_err(|reason| Self::fault(address, size, "write", reason))?;
+            if let Some(result) = self.devices.write(address, value, size) {
+                return result.map_err(|reason| Self::fault(address, size, "write", reason));
+            }
+        }
         if let Some(result) = self.devices.write_uart(address, value, size, &self.ram) {
             return result.map_err(|reason| Self::fault(address, size, "write", reason));
         }
@@ -459,7 +500,7 @@ impl Bus {
             return Ok(());
         }
         if let Some(result) = self.guards.write(address, value) {
-            self.guard_flag = self.guards.active() as u32;
+            self.guard_generation = self.guard_generation.wrapping_add(1);
             return result.map_err(|reason| Self::fault(address, size, "write", reason));
         }
         if let Some(result) = self.system.write(address, value) {
@@ -552,6 +593,31 @@ impl Bus {
     pub(crate) fn instruction_ticks_n(&mut self, count: u64) -> u64 {
         self.clock
             .instruction_ticks_n(self.audio.read(0x10014).unwrap(), count)
+    }
+
+    /// Changes whenever translated code may be stale: flash contents or
+    /// mapping (see `code_generation`) or the write-protection windows.
+    pub fn translation_generation(&self) -> u32 {
+        self.nor
+            .generation
+            .wrapping_add(self.guard_generation.wrapping_mul(0x9e37_79b9))
+    }
+
+    pub(crate) fn guard_windows(&self) -> Vec<(u32, u32)> {
+        self.guards.windows().to_vec()
+    }
+
+    /// Guest XIP ranges `[start, end)` whose reads are plain host memory with
+    /// no side effects, as `(start, end, host pointer for start)`.
+    pub(crate) fn xip_data_view(&self) -> Vec<(u32, u32, *const u8)> {
+        let end = XIP + self.flash.len() as u32;
+        if !self.nor.xip_active() {
+            return Vec::new();
+        }
+        if !self.nor.packaged() {
+            return vec![(XIP, end, self.flash.as_ptr())];
+        }
+        self.nor.xip_segments(XIP, end)
     }
 
     pub(crate) fn ram(&self) -> &[u8] {

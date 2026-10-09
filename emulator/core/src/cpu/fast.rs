@@ -58,7 +58,9 @@ impl Cpu {
         Ok(())
     }
 
-    fn batch_ready(&self) -> bool {
+    /// Whether batched (and translated) execution may run now: one core
+    /// has work and no IDLE or hold-off is pending.
+    pub fn batch_ready(&self) -> bool {
         if self.idle || self.bus_locked || self.idle_wake_delay != 0 || !self.time_warp {
             return false;
         }
@@ -133,14 +135,102 @@ impl Cpu {
                 break;
             }
         }
-        if count != 0 {
-            self.steps += count;
-            self.batched_steps += count;
-            let ticks = self.bus.instruction_ticks_n(count) as u32 + self.warp_ticks(poll_pc);
-            self.advance_time(ticks, start_pc)?;
-            self.idle_wake_delay = self.idle_wake_delay.saturating_sub(count.min(255) as u8);
-            self.dispatch_interrupt()?;
-        }
+        self.finish_batch(count, start_pc, poll_pc)?;
         Ok(count)
+    }
+
+    /// Account for `count` instructions run outside `step` (by a batch or a
+    /// translated block) starting at `start_pc`: advance guest time and
+    /// devices, fast-forward a wait if the batch ended on a timer poll at
+    /// `poll_pc`, and dispatch a pending interrupt.
+    pub fn finish_batch(
+        &mut self,
+        count: u64,
+        start_pc: u32,
+        poll_pc: Option<u32>,
+    ) -> Result<(), Fault> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.steps += count;
+        self.batched_steps += count;
+        let ticks = self.bus.instruction_ticks_n(count) as u32 + self.warp_ticks(poll_pc);
+        self.advance_time(ticks, start_pc)?;
+        self.idle_wake_delay = self.idle_wake_delay.saturating_sub(count.min(255) as u8);
+        self.dispatch_interrupt()
+    }
+
+    /// Run the instruction at PC in the interpreter, without time or
+    /// interrupts. Returns its PC and operation name.
+    pub fn interpret(&mut self) -> Result<(u32, &'static str), Fault> {
+        self.execute_current()
+    }
+
+    /// Run the instruction at PC for a translated block, which continues
+    /// with the next instruction only if this returns `false`: there was no
+    /// timed device access or timer poll and the interpreter is not needed
+    /// next (the block also checks that control fell through).
+    pub fn interpret_for_block(&mut self) -> Result<(u32, &'static str, bool), Fault> {
+        let counters = self.batch_counters();
+        let (pc, name) = self.execute_current()?;
+        let stop = self.batch_counters() != counters || self.needs_interpreter();
+        Ok((pc, name, stop))
+    }
+
+    /// Run the instruction at PC, which lies in the selected arm of a
+    /// conditional block spanning to `end` with the arm ending at `then_end`.
+    pub fn interpret_predicated(
+        &mut self,
+        then_end: u32,
+        end: u32,
+    ) -> Result<(u32, &'static str), Fault> {
+        self.predicate_skip = Some((then_end, end));
+        self.execute_current()
+    }
+
+    pub(crate) fn predicate(&self) -> Option<(u32, u32)> {
+        self.predicate_skip
+    }
+
+    /// Counters a batch watches: device-register accesses and timer polls.
+    pub fn batch_counters(&self) -> (u64, u64) {
+        (self.bus.device_accesses.get(), self.bus.timer_polls.get())
+    }
+
+    /// Whether only the interpreter may run the next instruction (a
+    /// conditional block or repeat loop is in progress, or the core idles).
+    pub fn needs_interpreter(&self) -> bool {
+        self.idle || self.predicate_skip.is_some() || self.repeat.is_some()
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.idle
+    }
+
+    /// Translate the block at `pc` for state at the addresses of this CPU.
+    pub fn translate_block(&mut self, pc: u32) -> Option<crate::wasmjit::Block> {
+        let layout = self.jit_layout();
+        crate::wasmjit::translate(&self.bus, &mut self.decode, &layout, pc)
+    }
+
+    /// Addresses of the state translated code works on. Valid while this
+    /// CPU stays in place (it must not be moved after translating).
+    pub fn jit_layout(&self) -> crate::wasmjit::Layout {
+        let address = |pointer: *const u8| pointer as usize as u32;
+        crate::wasmjit::Layout {
+            r: address(self.r.as_ptr().cast()),
+            sr: address(self.sr.as_ptr().cast()),
+            pc: address((&self.pc as *const u32).cast()),
+            ram: address(self.bus.ram().as_ptr()),
+            writes: address((&self.bus.writes as *const u32).cast()),
+            interrupts: address((&self.interrupts_enabled as *const bool).cast()),
+            windows: self.bus.guard_windows(),
+            xip: self
+                .bus
+                .xip_data_view()
+                .into_iter()
+                .map(|(start, end, host)| (start, end, address(host)))
+                .collect(),
+        }
     }
 }

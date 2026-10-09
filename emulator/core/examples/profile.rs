@@ -26,6 +26,9 @@ fn main() -> Result<(), String> {
             }
         }
     } else {
+        if env::var_os("PROFILE_DEVICES").is_some() {
+            *cpu.bus.device_log.borrow_mut() = Some(HashMap::new());
+        }
         if env::var_os("PROFILE_UNBATCHED").is_some() {
             cpu.unbatched_ops = Some(HashMap::new());
         }
@@ -50,6 +53,14 @@ fn main() -> Result<(), String> {
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     for (op, count) in sorted.iter().take(25) {
         println!("{:>8.3}% {op}", *count as f64 * 100.0 / limit as f64);
+    }
+    if let Some(log) = cpu.bus.device_log.borrow_mut().take() {
+        let mut list: Vec<_> = log.into_iter().collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1));
+        for (address, count) in list.iter().take(15) {
+            let kind = if address & 1 == 1 { "write" } else { "read" };
+            println!("device {:08x} {kind} {count}", address & !1);
+        }
     }
     if let Some(fault) = fault {
         println!("fault: {fault}");

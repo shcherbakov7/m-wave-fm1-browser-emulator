@@ -9,6 +9,9 @@ use fm1_emu::{
 };
 use std::cell::RefCell;
 
+#[cfg(target_arch = "wasm32")]
+mod jit;
+
 /// Guest time (24 MHz oscillator ticks, here 100 ms) a key stays closed after
 /// a press, so that even a short click lasts long enough for firmware
 /// scanning and debounce however slowly the emulator runs.
@@ -24,6 +27,8 @@ struct Machine {
     held: [bool; PANEL_CONTROLS],
     release_after: [u64; PANEL_CONTROLS],
     closed: [bool; PANEL_CONTROLS],
+    #[cfg(target_arch = "wasm32")]
+    jit: jit::Jit,
 }
 
 impl Machine {
@@ -37,6 +42,8 @@ impl Machine {
             held: [false; PANEL_CONTROLS],
             release_after: [0; PANEL_CONTROLS],
             closed: [false; PANEL_CONTROLS],
+            #[cfg(target_arch = "wasm32")]
+            jit: jit::Jit::new(),
         }
     }
 
@@ -82,8 +89,14 @@ impl Machine {
         while remaining > 0 {
             let chunk = remaining.min(1 << 20);
             let cpu = self.cpu.as_mut().unwrap();
-            if let Err(error) = cpu.step_many(chunk as u64) {
-                self.fault = Some(format!("{error} (after {} steps)", cpu.steps));
+            #[cfg(target_arch = "wasm32")]
+            let result = self.jit.run(cpu, chunk as u64);
+            #[cfg(not(target_arch = "wasm32"))]
+            let result = cpu
+                .step_many(chunk as u64)
+                .map_err(|error| format!("{error} (after {} steps)", cpu.steps));
+            if let Err(error) = result {
+                self.fault = Some(error);
                 return 1;
             }
             remaining -= chunk;
@@ -256,9 +269,25 @@ pub extern "C" fn fm1_status() -> usize {
     with(|m| {
         let text = match &m.cpu {
             None => "{\"loaded\":false}".to_string(),
-            Some(cpu) => format!(
+            Some(cpu) => {
+                #[cfg(target_arch = "wasm32")]
+                let jit = format!(
+                    "{{\"enabled\":{},\"compiled\":{},\"failed\":{},\"translatedSteps\":{},\
+                     \"blockCalls\":{},\"execCalls\":{},\"batches\":{}}}",
+                    m.jit.enabled,
+                    m.jit.stats.compiled,
+                    m.jit.stats.failed,
+                    m.jit.stats.translated_steps,
+                    m.jit.stats.block_calls,
+                    // SAFETY: plain read on the single host thread.
+                    unsafe { *std::ptr::addr_of!(jit::EXEC_CALLS) },
+                    m.jit.stats.batches
+                );
+                #[cfg(not(target_arch = "wasm32"))]
+                let jit = "null".to_string();
+                format!(
                 "{{\"loaded\":true,\"steps\":{},\"guestSeconds\":{},\"irqs\":{},\"lcdPixels\":{},\
-                 \"visible\":{},\"audioFrames\":{},\"watchdogFeeds\":{},\"fault\":{}}}",
+                 \"visible\":{},\"audioFrames\":{},\"watchdogFeeds\":{},\"jit\":{},\"fault\":{}}}",
                 cpu.steps,
                 cpu.bus.oscillator_ticks as f64 / 24e6,
                 cpu.irq_entries,
@@ -266,10 +295,12 @@ pub extern "C" fn fm1_status() -> usize {
                 cpu.bus.screen_visible(),
                 cpu.bus.audio.frames,
                 cpu.bus.system.watchdog_feeds,
+                jit,
                 m.fault
                     .as_ref()
                     .map_or("null".to_string(), |f| format!("{f:?}")),
-            ),
+                )
+            }
         };
         m.set_message(&text)
     })
@@ -283,4 +314,52 @@ pub extern "C" fn fm1_message_ptr() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn fm1_message_len() -> usize {
     with(|m| m.message.len())
+}
+
+/// Turn block translation on (1) or off (0) for the loaded machine.
+#[no_mangle]
+pub extern "C" fn fm1_set_jit(enabled: u32) {
+    with(|_m| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            _m.jit.enabled = enabled != 0;
+        }
+        let _ = enabled;
+    })
+}
+
+/// Start (1) or stop and report (0) counting interpreter calls from
+/// translated blocks; the report goes to the message buffer.
+#[no_mangle]
+pub extern "C" fn fm1_profile_exec(start: u32) -> usize {
+    #[cfg(target_arch = "wasm32")]
+    // SAFETY: single host thread; not called while a block runs.
+    unsafe {
+        let ops = &mut *std::ptr::addr_of_mut!(jit::EXEC_OPS);
+        if start != 0 {
+            *ops = Some(Default::default());
+            return 0;
+        }
+        let by_pc = ops.take().unwrap_or_default();
+        let mut by_name: std::collections::HashMap<&str, u64> = Default::default();
+        for ((name, _), count) in &by_pc {
+            *by_name.entry(name).or_default() += count;
+        }
+        let mut list: Vec<_> = by_name.into_iter().collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut text: Vec<String> = list.iter().take(30).map(|(n, c)| format!("{n} {c}")).collect();
+        let mut pcs: Vec<_> = by_pc.into_iter().collect();
+        pcs.sort_by(|a, b| b.1.cmp(&a.1));
+        text.extend(
+            pcs.iter()
+                .take(30)
+                .map(|((name, pc), count)| format!("pc {pc:08x} {name} {count}")),
+        );
+        return with(|m| m.set_message(&text.join("\n")));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = start;
+        0
+    }
 }
