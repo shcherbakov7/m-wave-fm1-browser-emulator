@@ -40,8 +40,9 @@ pub struct Layout {
     pub writes: u32,
     /// The interrupt-enable flag (one byte, 0 or 1).
     pub interrupts: u32,
-    /// Enabled CPU write-protection windows, inclusive `(low, high)`.
-    pub windows: Vec<(u32, u32)>,
+    /// The CPU write-protection windows: three inclusive `(low, high)` u32
+    /// pairs, unused ones `(0, 0)` (see `Bus::guard_table`).
+    pub guards: u32,
     /// Side-effect-free XIP reads: guest `[start, end)` at host `host +
     /// (address - start)`, for each segment.
     pub xip: Vec<(u32, u32, u32)>,
@@ -479,17 +480,20 @@ impl Translator<'_> {
         }
         if store {
             // Outside every write-protection window.
-            for &(low_window, high_window) in &self.layout.windows.clone() {
+            for window in 0..3 {
+                let address = self.layout.guards + 8 * window;
                 self.body
                     .get(ADDR)
                     .i32(low)
                     .op(I32_ADD)
-                    .u32(high_window)
+                    .i32(0)
+                    .load(4, false, address + 4)
                     .op(I32_GT_U)
                     .get(ADDR)
                     .i32(high)
                     .op(I32_ADD)
-                    .u32(low_window)
+                    .i32(0)
+                    .load(4, false, address)
                     .op(I32_LE_U)
                     .op(I32_OR)
                     .op(I32_AND);
@@ -1158,7 +1162,15 @@ fn instruction(
             }
             t.body.set(VALUE);
             t.set_sr(11, VALUE);
-            Some((Flow::Continue, 2))
+            if !enable {
+                return Some((Flow::Continue, 2));
+            }
+            // A pending interrupt (such as an RTOS yield) is taken right
+            // after STI: return to the host, which dispatches it.
+            t.set_pc_const(pc + 2);
+            t.flush();
+            t.finish_flushed();
+            Some((Flow::End, 2))
         }
         First::Extended(extended) => extended_instruction(t, bus, decode, pc, h, extended, word),
         _ => {
@@ -1677,6 +1689,68 @@ fn wide_instruction(
             t.body.end();
             Some((Flow::Continue, 4))
         }
+        kind @ (Wide::MemoryPair
+        | Wide::PairPostincrement
+        | Wide::PairIndexed
+        | Wide::PairRegisterPreincrement) => {
+            // Two words at ADDR (as `Cpu::execute_current`); some forms
+            // also update r[s] to WRITEBACK.
+            t.r(s);
+            let writeback = match kind {
+                Wide::MemoryPair => {
+                    let offset =
+                        (signed(h & 7, 3) << 8) | (((x >> 8) & 15) << 4) as i32 | (x & 12) as i32;
+                    t.body.i32(offset).op(I32_ADD).set(ADDR);
+                    false
+                }
+                Wide::PairPostincrement => {
+                    let stride =
+                        (signed(h & 7, 3) << 8) + ((((x >> 8) & 15) << 4) | (x & 12)) as i32;
+                    t.body.set(ADDR).get(ADDR).i32(stride).op(I32_ADD).set(WRITEBACK);
+                    true
+                }
+                Wide::PairIndexed => {
+                    t.r(c);
+                    if x & 8 != 0 {
+                        t.body.i32(3).op(I32_SHL);
+                    }
+                    t.body.op(I32_ADD).set(ADDR);
+                    false
+                }
+                _ => {
+                    t.r(c);
+                    t.body.op(I32_ADD).set(ADDR).get(ADDR).set(WRITEBACK);
+                    true
+                }
+            };
+            let reg = d & 14;
+            let store = x & 1 != 0;
+            t.fast(0, 8, 4, store);
+            t.body.if_();
+            if store {
+                t.r(reg);
+                t.body.set(VALUE);
+                t.store_at(0, 4, VALUE);
+                t.r(reg + 1);
+                t.body.set(VALUE);
+                t.store_at(4, 4, VALUE);
+                if writeback {
+                    t.set_r(s, WRITEBACK);
+                }
+            } else {
+                t.load_at(0, 4, false, LEFT);
+                t.load_at(4, 4, false, RIGHT);
+                if writeback {
+                    t.set_r(s, WRITEBACK);
+                }
+                t.set_r(reg, LEFT);
+                t.set_r(reg + 1, RIGHT);
+            }
+            t.body.else_();
+            t.exec(pc);
+            t.body.end();
+            Some((Flow::Continue, 4))
+        }
         Wide::StoreImmediate => {
             t.r(d);
             t.body.u32((h & 31) * 4).op(I32_ADD).set(ADDR);
@@ -2105,6 +2179,12 @@ fn conditional(
         };
         match instruction(&mut arm, bus, decode, cursor, word as u32) {
             Some((Flow::Continue, length)) => cursor += length,
+            // A branch or call ending a block without an else arm: the
+            // skip at then_end would go to then_end, so none is pending.
+            Some((Flow::End, length)) if cursor + length == then_end && then_end == end => {
+                cursor += length;
+                break;
+            }
             _ => break,
         }
     }

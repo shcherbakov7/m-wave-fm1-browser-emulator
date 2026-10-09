@@ -17,9 +17,15 @@ pub struct Nor {
     write_enabled: bool,
     busy_ticks: u32,
     pending: Option<Pending>,
-    /// Bumped whenever what XIP returns could change (register writes, busy
-    /// start/end, program/erase, load). Instruction-word caches compare it.
+    /// Identifies what XIP returns: a hash of the flash contents' version,
+    /// the busy state and the mapping registers. It changes whenever XIP
+    /// could return something else, and returns to an earlier value when
+    /// the mapping does (XIP turned off and on again around SPI transfers),
+    /// so instruction caches and translations stay valid. Caches compare it.
     pub(crate) generation: u32,
+    /// Version of the flash contents: bumped on load and when a program or
+    /// erase completes.
+    contents: u32,
 }
 
 impl Default for Nor {
@@ -36,6 +42,7 @@ impl Default for Nor {
             busy_ticks: 0,
             pending: None,
             generation: 0,
+            contents: 0,
         }
     }
 }
@@ -60,7 +67,27 @@ impl Nor {
         self.decoded = Some(decoded);
         self.key = key;
         self.regs[..3].copy_from_slice(&[0x809803b5, 1, 0x8e17]);
-        self.generation = self.generation.wrapping_add(1);
+        self.contents = self.contents.wrapping_add(1);
+        self.refresh_generation();
+    }
+
+    /// Recompute `generation` from what decides XIP reads.
+    fn refresh_generation(&mut self) {
+        let busy = self.busy_ticks != 0 || self.pending.is_some();
+        let mut hash = 0x811c_9dc5u32;
+        for word in [
+            self.contents,
+            busy as u32,
+            self.regs[0],
+            self.regs[3],
+            self.regs[4],
+            self.regs[6],
+            self.regs[7],
+            self.regs[10],
+        ] {
+            hash = (hash ^ word).wrapping_mul(0x0100_0193).rotate_left(5);
+        }
+        self.generation = hash;
     }
     pub fn packaged(&self) -> bool {
         self.decoded.is_some()
@@ -188,13 +215,13 @@ impl Nor {
                 let address = ((*a as usize) << 16) | ((*b as usize) << 8) | *c as usize;
                 self.pending = Some(Pending::Program(address % self.bytes.len(), data.to_vec()));
                 self.busy_ticks = 48_000;
-                self.generation = self.generation.wrapping_add(1);
+                self.refresh_generation();
             }
             [0x20, a, b, c] if self.write_enabled => {
                 let address = ((*a as usize) << 16) | ((*b as usize) << 8) | *c as usize;
                 self.pending = Some(Pending::Erase(address % self.bytes.len() & !0xfff));
                 self.busy_ticks = 192_000;
-                self.generation = self.generation.wrapping_add(1);
+                self.refresh_generation();
             }
             _ => {}
         }
@@ -208,7 +235,7 @@ impl Nor {
         if self.busy_ticks != 0 {
             return;
         }
-        self.generation = self.generation.wrapping_add(1);
+        self.contents = self.contents.wrapping_add(1);
         let (start, end) = match self.pending.take() {
             Some(Pending::Program(address, data)) => {
                 let page = address & !255;
@@ -223,7 +250,10 @@ impl Nor {
                 self.bytes[address..address + 4096].fill(255);
                 (address, address + 4096)
             }
-            None => return,
+            None => {
+                self.refresh_generation();
+                return;
+            }
         };
         self.write_enabled = false;
         if let Some(decoded) = &mut self.decoded {
@@ -236,6 +266,7 @@ impl Nor {
                 }
             }
         }
+        self.refresh_generation();
     }
     pub fn write(&mut self, a: u32, v: u32) -> Option<Result<(), &'static str>> {
         self.read(a)?;
@@ -294,10 +325,11 @@ impl Nor {
         let index = Self::register_index(a).unwrap();
         // Only SFC_CON, SFC_BASE, the encryption controls and flash pin
         // routing change what XIP returns; SPI0 transfers do not.
-        if matches!(index, 0 | 3 | 4 | 6 | 7 | 10) && self.regs[index] != value {
-            self.generation = self.generation.wrapping_add(1);
-        }
+        let maps = matches!(index, 0 | 3 | 4 | 6 | 7 | 10) && self.regs[index] != value;
         self.regs[index] = value;
+        if maps {
+            self.refresh_generation();
+        }
         Some(Ok(()))
     }
 }

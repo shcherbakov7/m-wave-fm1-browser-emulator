@@ -6,6 +6,10 @@ pub struct Guards {
     /// Enabled write-protection windows `(low, high)` from DBG_EN/WR_LIMIT,
     /// refreshed on every guard write so `check_write` needs no map lookups.
     windows: Vec<(u32, u32)>,
+    /// The same as three `(low, high)` word pairs, unused ones `(0, 0)`
+    /// (above which every SRAM address lies), read in place by translated
+    /// code.
+    table: [u32; 6],
 }
 impl Guards {
     fn known(a: u32) -> bool {
@@ -68,11 +72,16 @@ impl Guards {
             .filter(|n| self.value(0x1eee348) & (1 << n) != 0)
             .map(|n| (self.value(0x1eee2c0 + n * 4), self.value(0x1eee280 + n * 4)))
             .collect();
+        self.table = [0; 6];
+        for (i, &(low, high)) in self.windows.iter().enumerate() {
+            self.table[2 * i] = low;
+            self.table[2 * i + 1] = high;
+        }
         Some(Ok(()))
     }
-    /// Enabled write-protection windows as inclusive `(low, high)`.
-    pub(crate) fn windows(&self) -> &[(u32, u32)] {
-        &self.windows
+    /// The window table (see `table`).
+    pub(crate) fn table(&self) -> &[u32; 6] {
+        &self.table
     }
     pub fn check_write(&self, a: u32, size: usize) -> Result<(), &'static str> {
         for &(low, high) in &self.windows {

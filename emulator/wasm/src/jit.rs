@@ -14,6 +14,8 @@ use std::collections::HashMap;
 extern "C" {
     /// Compile a block module; returns its function's table index or -1.
     fn jit_compile(bytes: *const u8, length: usize) -> i32;
+    /// The function at this table index is no longer used.
+    fn jit_release(index: i32);
 }
 
 /// Executions before a block is translated.
@@ -147,7 +149,25 @@ impl BlockRunner for Jit {
     }
 }
 
+impl Drop for Jit {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
 impl Jit {
+    /// Drop every translation and hand its function back to the host.
+    fn release_all(&mut self) {
+        for (_, slot) in &self.slots {
+            if let Slot::Ready(function) = slot {
+                // SAFETY: host import; nothing calls the index any more.
+                unsafe { jit_release(*function as usize as i32) };
+            }
+        }
+        self.slots.fill((u32::MAX, Slot::Unavailable));
+        self.chain.fill([u32::MAX, 0]);
+    }
+
     pub fn new() -> Self {
         Self {
             slots: vec![(u32::MAX, Slot::Unavailable); SLOTS],
@@ -165,15 +185,24 @@ impl Jit {
     fn block(&mut self, cpu: &mut Cpu, pc: u32) -> Option<extern "C" fn(u32) -> u32> {
         let generation = cpu.bus.translation_generation();
         if generation != self.generation {
-            // Flash, its mapping or the write guards changed: every
-            // translation may be stale.
-            self.slots.fill((u32::MAX, Slot::Unavailable));
-            self.chain.fill([u32::MAX, 0]);
+            if !cpu.bus.xip_active() {
+                // Nothing runs from flash now; keep the translations for
+                // when the same mapping returns.
+                return None;
+            }
+            // Flash or its mapping changed: every translation may be stale.
+            self.release_all();
             self.generation = generation;
         }
         let index = (pc >> 1) as usize & (SLOTS - 1);
         let entry = &mut self.slots[index];
         if entry.0 != pc {
+            if let Slot::Ready(function) = entry.1 {
+                // A colliding block takes the slot (and its chain entry).
+                self.chain[index] = [u32::MAX, 0];
+                // SAFETY: host import; nothing refers to the index any more.
+                unsafe { jit_release(function as usize as i32) };
+            }
             *entry = (pc, Slot::Counting(0));
         }
         match &mut entry.1 {

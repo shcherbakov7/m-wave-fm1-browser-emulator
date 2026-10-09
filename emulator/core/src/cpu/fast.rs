@@ -97,7 +97,7 @@ impl Cpu {
     /// Whether batched (and translated) execution may run now: one core
     /// has work and no IDLE or hold-off is pending.
     pub fn batch_ready(&self) -> bool {
-        if self.idle || self.bus_locked || self.idle_wake_delay != 0 || !self.time_warp {
+        if self.idle || self.idle_wake_delay != 0 || !self.time_warp {
             return false;
         }
         let control = self.bus.core_control(1);
@@ -105,10 +105,12 @@ impl Cpu {
             // `step` would start the secondary core from its handoff vector.
             None => control & 10 != 8,
             Some(core) => {
+                // While this core holds the bus lock the other does not run.
                 let running = control & 0x18 == 8;
                 control & 2 == 0
                     && self.bus.core_control(0) & 16 == 0
-                    && (!running || (core.idle && !core.bus_locked))
+                    && !core.bus_locked
+                    && (!running || core.idle || self.bus_locked)
             }
         }
     }
@@ -165,8 +167,10 @@ impl Cpu {
         blocks: &mut dyn BlockRunner,
     ) -> Result<(u64, Option<u32>), Fault> {
         let mut count = 0;
-        while count < max && !self.idle {
+        let locked = self.bus_locked;
+        while count < max && !self.idle && self.bus_locked == locked {
             let (devices, polls) = self.batch_counters();
+            let gate = self.interrupt_gate();
             let pc = self.pc;
             let ran = if self.predicate_skip.is_none() && self.repeat.is_none() {
                 blocks.run(self).transpose()?
@@ -185,7 +189,9 @@ impl Cpu {
             if now_polls != polls {
                 return Ok((count, Some(last_pc)));
             }
-            if now_devices != devices {
+            // Stop where an interrupt may have become deliverable, so that
+            // it enters right there as with `step`.
+            if now_devices != devices || self.interrupt_gate() != gate {
                 break;
             }
         }
@@ -200,14 +206,34 @@ impl Cpu {
         if count == 0 {
             return Ok(0);
         }
+        // The batch may have stopped or reset the other core, or taken the
+        // bus lock; then, as in `step`, the other core does not run.
+        let control = self.bus.core_control(1);
+        if control & 2 != 0 || control & 0x18 != 8 || self.bus_locked {
+            self.finish_batch(count, start_pc, None)?;
+            return Ok(count);
+        }
         let mut secondary = self.secondary.take().unwrap();
         secondary.swap(self);
-        let result = self.run_core(count, blocks).and_then(|(executed, _)| {
-            self.steps += executed;
-            self.batched_steps += executed;
-            self.idle_wake_delay = self.idle_wake_delay.saturating_sub(executed.min(255) as u8);
-            self.dispatch_interrupt()
-        });
+        // Keep pace with the primary: run the same number of instructions
+        // across device accesses (which only end a run so that guest time
+        // can advance, and it stands still while the secondary runs), unless
+        // the secondary idles or takes the bus lock. Firmware boot races
+        // between the cores depend on them running at the same rate.
+        let mut result = Ok(());
+        let mut executed = 0;
+        while executed < count && !self.idle && !self.bus_locked {
+            result = self.run_core(count - executed, blocks).and_then(|(ran, _)| {
+                executed += ran;
+                self.steps += ran;
+                self.batched_steps += ran;
+                self.idle_wake_delay = self.idle_wake_delay.saturating_sub(ran.min(255) as u8);
+                self.dispatch_interrupt()
+            });
+            if result.is_err() {
+                break;
+            }
+        }
         secondary.swap(self);
         self.secondary = Some(secondary);
         result?;
@@ -230,7 +256,12 @@ impl Cpu {
         }
         self.steps += count;
         self.batched_steps += count;
-        let ticks = self.bus.instruction_ticks_n(count) as u32 + self.warp_ticks(poll_pc);
+        let warp = match poll_pc {
+            Some(_) => self.warp_ticks(poll_pc),
+            None if self.idle => self.warp_ticks(None),
+            None => self.spin_ticks(count),
+        };
+        let ticks = self.bus.instruction_ticks_n(count) as u32 + warp;
         self.advance_time(ticks, start_pc)?;
         self.idle_wake_delay = self.idle_wake_delay.saturating_sub(count.min(255) as u8);
         self.dispatch_interrupt()
@@ -248,8 +279,13 @@ impl Cpu {
     /// next (the block also checks that control fell through).
     pub fn interpret_for_block(&mut self) -> Result<(u32, &'static str, bool), Fault> {
         let counters = self.batch_counters();
+        let locked = self.bus_locked;
+        let gate = self.interrupt_gate();
         let (pc, name) = self.execute_current()?;
-        let stop = self.batch_counters() != counters || self.needs_interpreter();
+        let stop = self.batch_counters() != counters
+            || self.needs_interpreter()
+            || self.bus_locked != locked
+            || self.interrupt_gate() != gate;
         Ok((pc, name, stop))
     }
 
@@ -260,7 +296,8 @@ impl Cpu {
         then_end: u32,
         end: u32,
     ) -> Result<(u32, &'static str), Fault> {
-        self.predicate_skip = Some((then_end, end));
+        // As `conditional`: no skip is pending without an else arm.
+        self.predicate_skip = (then_end != end).then_some((then_end, end));
         self.execute_current()
     }
 
@@ -296,6 +333,16 @@ impl Cpu {
         self.idle || self.predicate_skip.is_some() || self.repeat.is_some()
     }
 
+    /// The other core's PC, idle and bus-lock state (diagnostics).
+    pub fn secondary_state(&self) -> Option<(u32, bool, bool)> {
+        self.secondary.as_ref().map(|core| (core.pc, core.idle, core.bus_locked))
+    }
+
+    /// What decides whether an interrupt can enter (see `dispatch_interrupt`).
+    fn interrupt_gate(&self) -> (bool, bool, u32) {
+        (self.interrupts_enabled, self.in_interrupt, self.sr[11])
+    }
+
     pub fn is_idle(&self) -> bool {
         self.idle
     }
@@ -323,7 +370,7 @@ impl Cpu {
             ram: address(self.bus.ram().as_ptr()),
             writes: address((&self.bus.writes as *const u32).cast()),
             interrupts: address((&self.interrupts_enabled as *const bool).cast()),
-            windows: self.bus.guard_windows(),
+            guards: address(self.bus.guard_table().as_ptr().cast()),
             xip: self
                 .bus
                 .xip_data_view()

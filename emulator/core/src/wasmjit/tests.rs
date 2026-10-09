@@ -17,6 +17,8 @@ const STATE_IRQ: u32 = 0x184;
 const STATE_WRITES: u32 = 0x188;
 /// One-entry chain table (see `Layout::chain`).
 const STATE_CHAIN: u32 = 0x1c0;
+/// Write-protection window table (see `Layout::guards`).
+const STATE_GUARDS: u32 = 0x1e0;
 const STATE_RAM: u32 = 0x10000;
 const STATE_XIP: u32 = 0x90000;
 
@@ -28,7 +30,7 @@ fn layout(cpu: &Cpu) -> Layout {
         ram: STATE_RAM,
         writes: STATE_WRITES,
         interrupts: STATE_IRQ,
-        windows: cpu.bus.guard_windows(),
+        guards: STATE_GUARDS,
         xip: vec![(XIP, XIP + cpu.bus.flash.len() as u32, STATE_XIP)],
         chain: None,
     }
@@ -91,10 +93,17 @@ fn to_wasm(memory: &mut [u8], cpu: &Cpu) {
     put(memory, STATE_PC, cpu.pc);
     put(memory, STATE_WRITES, cpu.bus.writes);
     memory[STATE_IRQ as usize] = cpu.interrupts_enabled as u8;
+    put_guards(memory, cpu);
     let flash = &cpu.bus.flash;
     memory[STATE_XIP as usize..STATE_XIP as usize + flash.len()].copy_from_slice(flash);
     let ram = cpu.bus.ram();
     memory[STATE_RAM as usize..STATE_RAM as usize + ram.len()].copy_from_slice(ram);
+}
+
+fn put_guards(memory: &mut [u8], cpu: &Cpu) {
+    for (i, &word) in cpu.bus.guard_table().iter().enumerate() {
+        put(memory, STATE_GUARDS + 4 * i as u32, word);
+    }
 }
 
 fn from_wasm(memory: &[u8], cpu: &mut Cpu) {
@@ -394,6 +403,8 @@ fn random_instructions_match_the_interpreter() {
         "load32",
         "store32",
         "stack_word",
+        "memory_pair",
+        "memory_pair_extended",
         "branch_zero",
         "branch_compare_immediate",
         "branch_compare_register",
@@ -523,6 +534,7 @@ fn firmware_instructions_match_the_interpreter() {
             put(data, STATE_PC, cpu.pc);
             put(data, STATE_WRITES, cpu.bus.writes);
             data[STATE_IRQ as usize] = cpu.interrupts_enabled as u8;
+            put_guards(data, &cpu);
             data[STATE_RAM as usize..STATE_RAM as usize + ram_before.len()]
                 .copy_from_slice(&ram_before);
         }

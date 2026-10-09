@@ -25,11 +25,12 @@ export function supportsTailCalls() {
  */
 export async function instantiateFm1(bytes, options = {}) {
   let exports = null;
-  let free = 0, end = 0; // unused function table slots [free, end)
+  let free = 0, end = 0; // never used function table slots [free, end)
+  const released = [];   // slots of functions the emulator dropped
   const env = {
     // Compile one translated block (a module importing env.memory, env.exec,
     // env.exec_pred and, when chaining, env.table; exporting b: (i32) -> i32)
-    // and append b to the function table.
+    // and store b in the function table; returns its index.
     jit_compile(pointer, length) {
       try {
         const code = new Uint8Array(exports.memory.buffer, pointer, length);
@@ -38,15 +39,23 @@ export async function instantiateFm1(bytes, options = {}) {
         const instance = new WebAssembly.Instance(module, {
           env: { memory: exports.memory, exec: exports.fm1_jit_exec, exec_pred: exports.fm1_jit_exec_pred, table },
         });
-        // Growing copies the table, so grow it in chunks.
-        if (free === end) { free = table.grow(256); end = free + 256; }
-        const index = free++;
+        let index = released.pop();
+        if (index === undefined) {
+          // Growing copies the table, so grow it in chunks.
+          if (free === end) { free = table.grow(256); end = free + 256; }
+          index = free++;
+        }
         table.set(index, instance.exports.b);
         return index;
       } catch (error) {
         console.error("block compilation failed", error);
         return -1;
       }
+    },
+    // A translated function is no longer used: drop it and reuse its slot.
+    jit_release(index) {
+      exports.__indirect_function_table.set(index, null);
+      released.push(index);
     },
   };
   const { instance } = await WebAssembly.instantiate(bytes, { env });

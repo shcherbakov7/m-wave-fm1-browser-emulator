@@ -18,6 +18,10 @@ fn main() -> Result<(), String> {
     while cpu.pc != pc && cpu.steps < limit {
         cpu.step().map_err(|e| e.to_string())?;
     }
+    let words: Vec<String> = (0..24)
+        .map(|i| format!("{:04x}", cpu.bus.fetch(pc + 2 * i).unwrap_or(0)))
+        .collect();
+    println!("{pc:08x}: {}", words.join(" "));
     let block = cpu.translate_block(pc, None).ok_or("not translatable")?;
     std::fs::write(out, &block.wasm).map_err(|e| e.to_string())?;
     println!("{} instructions, {} bytes, after {} steps", block.instructions, block.wasm.len(), cpu.steps);

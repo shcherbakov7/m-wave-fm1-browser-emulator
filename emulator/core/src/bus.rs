@@ -112,9 +112,6 @@ pub struct Bus {
     /// Guest writes of any kind (wrapping), for recognizing side-effect-free
     /// loops. Translated code increments it in place.
     pub(crate) writes: u32,
-    /// Bumped when the write-protection windows change; translated code has
-    /// them built in.
-    guard_generation: u32,
     /// Accesses that reached time-dependent device registers (not SRAM,
     /// XIP or GPIO ports); batches end after one so devices are brought up
     /// to date first.
@@ -135,7 +132,7 @@ struct CodeEntry {
 const CODE_SLOTS: usize = 1 << 16;
 
 impl Bus {
-    pub(crate) fn core_control(&self, core: usize) -> u32 {
+    pub fn core_control(&self, core: usize) -> u32 {
         self.cache.core_control(core)
     }
     pub(crate) fn load_flash(&mut self, bytes: &[u8], key: u16) {
@@ -173,7 +170,6 @@ impl Bus {
             oscillator_ticks: 0,
             timer_polls: Default::default(),
             writes: 0,
-            guard_generation: 0,
             device_accesses: Default::default(),
             device_log: Default::default(),
             code_cache: vec![
@@ -500,7 +496,6 @@ impl Bus {
             return Ok(());
         }
         if let Some(result) = self.guards.write(address, value) {
-            self.guard_generation = self.guard_generation.wrapping_add(1);
             return result.map_err(|reason| Self::fault(address, size, "write", reason));
         }
         if let Some(result) = self.system.write(address, value) {
@@ -596,15 +591,21 @@ impl Bus {
     }
 
     /// Changes whenever translated code may be stale: flash contents or
-    /// mapping (see `code_generation`) or the write-protection windows.
+    /// mapping (see `code_generation`). Translated code reads the
+    /// write-protection windows in place (`guard_table`).
     pub fn translation_generation(&self) -> u32 {
-        self.nor
-            .generation
-            .wrapping_add(self.guard_generation.wrapping_mul(0x9e37_79b9))
+        self.nor.generation
     }
 
-    pub(crate) fn guard_windows(&self) -> Vec<(u32, u32)> {
-        self.guards.windows().to_vec()
+    /// Whether code can run from XIP flash now.
+    pub fn xip_active(&self) -> bool {
+        self.nor.xip_active()
+    }
+
+    /// The write-protection windows as three `(low, high)` word pairs,
+    /// unused ones `(0, 0)`.
+    pub(crate) fn guard_table(&self) -> &[u32; 6] {
+        self.guards.table()
     }
 
     /// Guest XIP ranges `[start, end)` whose reads are plain host memory with

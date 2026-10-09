@@ -184,6 +184,9 @@ pub struct Cpu {
     warp_allowed: bool,
     /// Last timer poll: (pc, steps, bus writes, irq entries).
     last_poll: (u32, u64, u32, u64),
+    /// State at the end of the previous batch, to recognize a core spinning
+    /// on memory (see `spin_ticks`).
+    last_spin: Box<Spin>,
     fast: fast::Cache,
     /// Steps executed by batches (diagnostics).
     pub batched_steps: u64,
@@ -196,6 +199,17 @@ pub struct Cpu {
 /// interrupt. The guest sees a faster CPU during the wait; interrupts and
 /// device events still arrive in order, at most 1 µs late.
 const WARP_TICKS: u32 = 24;
+
+/// A core's registers, PC and the bus write and IRQ counters, as compared
+/// between batches by `Cpu::spin_ticks`.
+#[derive(Default, PartialEq)]
+struct Spin {
+    pc: u32,
+    writes: u32,
+    irqs: u64,
+    r: [u32; 16],
+    sr: [u32; 16],
+}
 
 // Per-core context. Memory and devices remain on the one shared bus.
 struct Core {
@@ -302,6 +316,7 @@ impl Cpu {
             time_warp: true,
             warp_allowed: false,
             last_poll: (u32::MAX, 0, 0, 0),
+            last_spin: Box::new(Spin::default()),
             fast: Default::default(),
             batched_steps: 0,
             unbatched_ops: None,
@@ -364,9 +379,12 @@ impl Cpu {
             self.warp_allowed = false;
             return self.step_secondary(true);
         }
-        // Only warp when no other core is doing work that needs the time.
+        // Only warp when no other core is doing work that needs the time
+        // (one holding the bus lock keeps the other from running).
         self.warp_allowed = self.time_warp
-            && !(secondary_running && self.secondary.as_ref().is_some_and(|core| !core.idle));
+            && !(secondary_running
+                && !self.bus_locked
+                && self.secondary.as_ref().is_some_and(|core| !core.idle));
         let op = self.step_core(true)?;
         if !self.bus_locked && secondary_running {
             self.step_secondary(false)?;
@@ -400,6 +418,37 @@ impl Cpu {
         self.idle_wake_delay = self.idle_wake_delay.saturating_sub(1);
         self.dispatch_interrupt()?;
         Ok(op)
+    }
+
+    /// Extra guest time for a batch of `count` instructions that left this
+    /// core exactly as the previous batch did: same PC and registers, and no
+    /// memory written or interrupt taken in between. It is waiting for
+    /// something outside it (an interrupt, a device, DMA), so fast-forward
+    /// as `warp_ticks` does. Only for a core that runs alone.
+    pub(crate) fn spin_ticks(&mut self, count: u64) -> u32 {
+        let spin = Spin {
+            pc: self.pc,
+            writes: self.bus.writes,
+            irqs: self.irq_entries,
+            r: self.r,
+            sr: self.sr,
+        };
+        let same = *self.last_spin == spin;
+        *self.last_spin = spin;
+        if same && self.runs_alone() {
+            WARP_TICKS * count.min(64) as u32
+        } else {
+            0
+        }
+    }
+
+    /// Whether no other core is running work alongside this one.
+    pub(crate) fn runs_alone(&self) -> bool {
+        let control = self.bus.core_control(1);
+        match &self.secondary {
+            None => true,
+            Some(core) => control & 0x18 != 8 || core.idle || self.bus_locked,
+        }
     }
 
     /// Extra guest time for a wait: idling, or polling a timer at `poll_pc`
@@ -589,7 +638,9 @@ impl Cpu {
             }
         }
         if test {
-            self.predicate_skip = Some((then_end, cursor));
+            // Without an else arm the skip would be to where it starts:
+            // nothing is pending (and a call in the arm runs at full speed).
+            self.predicate_skip = (then_end != cursor).then_some((then_end, cursor));
             Ok(self.pc + 4)
         } else {
             Ok(then_end)
