@@ -58,8 +58,8 @@ pub(crate) enum Op {
 }
 #[derive(Clone, Copy)]
 pub(crate) struct Instruction {
-    pc: u32,
-    words: [u16; 3],
+    pub(crate) pc: u32,
+    pub(crate) words: [u16; 3],
     pub(crate) length: u8,
     pub(crate) op: Op,
     pub(crate) name: &'static str,
@@ -328,7 +328,12 @@ fn build(bus: &Bus, decode: &mut Decode, start: u32, first: u16) -> Block {
         native: None,
     }
 }
-fn prepare(bus: &Bus, decode: &mut Decode, pc: u32, word: u16) -> Option<Instruction> {
+pub(crate) fn prepare(
+    bus: &Bus,
+    decode: &mut Decode,
+    pc: u32,
+    word: u16,
+) -> Option<Instruction> {
     let h = word as u32;
     // Parallel bundles retain their original simultaneous-source semantics.
     if h >> 13 == 6 || h & 0xf800 == 0xf000 {

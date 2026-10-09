@@ -82,11 +82,9 @@ impl Machine {
         while remaining > 0 {
             let chunk = remaining.min(1 << 20);
             let cpu = self.cpu.as_mut().unwrap();
-            for _ in 0..chunk {
-                if let Err(error) = cpu.step() {
-                    self.fault = Some(format!("{error} (after {} steps)", cpu.steps));
-                    return 1;
-                }
+            if let Err(error) = cpu.step_many(chunk as u64) {
+                self.fault = Some(format!("{error} (after {} steps)", cpu.steps));
+                return 1;
             }
             remaining -= chunk;
             self.sync_keys();

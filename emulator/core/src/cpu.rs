@@ -8,6 +8,8 @@ use crate::{
 };
 use std::{fmt, io::Write};
 
+mod fast;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Fault {
     Access { pc: u32, fault: AccessFault },
@@ -179,6 +181,11 @@ pub struct Cpu {
     warp_allowed: bool,
     /// Last timer poll: (pc, steps, bus writes, irq entries).
     last_poll: (u32, u64, u64, u64),
+    fast: fast::Cache,
+    /// Steps executed by batches (diagnostics).
+    pub batched_steps: u64,
+    /// When set, counts the operations `step_many` had to run singly.
+    pub unbatched_ops: Option<std::collections::HashMap<&'static str, u64>>,
 }
 
 /// Oscillator ticks (1 µs) added per step while the only running core spins
@@ -292,6 +299,9 @@ impl Cpu {
             time_warp: true,
             warp_allowed: false,
             last_poll: (u32::MAX, 0, 0, 0),
+            fast: Default::default(),
+            batched_steps: 0,
+            unbatched_ops: None,
         }
     }
 
@@ -299,6 +309,16 @@ impl Cpu {
         self.bus
             .read(address, size)
             .map_err(|fault| Fault::Access { pc: self.pc, fault })
+    }
+
+    /// An instruction-stream halfword: opcode or operand of the current
+    /// instruction (cached for XIP).
+    pub(crate) fn code(&mut self, address: u32) -> Result<u32, Fault> {
+        let pc = self.pc;
+        self.bus
+            .code(address)
+            .map(u32::from)
+            .map_err(|fault| Fault::Access { pc, fault })
     }
 
     pub(crate) fn write(&mut self, address: u32, value: u32) -> Result<(), Fault> {
@@ -361,6 +381,48 @@ impl Cpu {
     }
 
     fn step_core(&mut self, advance_time: bool) -> Result<&'static str, Fault> {
+        let polls_before = self.bus.timer_polls.get();
+        let (pc, op) = self.execute_current()?;
+        self.steps += 1;
+        let mut ticks = if advance_time {
+            self.bus.instruction_ticks()
+        } else {
+            0
+        };
+        if advance_time && self.warp_allowed {
+            let polled = self.bus.timer_polls.get() != polls_before;
+            ticks += self.warp_ticks(polled.then_some(pc));
+        }
+        self.advance_time(ticks, pc)?;
+        self.idle_wake_delay = self.idle_wake_delay.saturating_sub(1);
+        self.dispatch_interrupt()?;
+        Ok(op)
+    }
+
+    /// Extra guest time for a wait: idling, or polling a timer at `poll_pc`
+    /// in a loop that wrote nothing since its previous poll there.
+    fn warp_ticks(&mut self, poll_pc: Option<u32>) -> u32 {
+        if self.idle {
+            return WARP_TICKS;
+        }
+        let Some(pc) = poll_pc else { return 0 };
+        let (last_pc, last_steps, last_writes, last_irqs) = self.last_poll;
+        let spinning = last_pc == pc
+            && self.steps - last_steps <= 64
+            && self.bus.writes == last_writes
+            && self.irq_entries == last_irqs;
+        self.last_poll = (pc, self.steps, self.bus.writes, self.irq_entries);
+        if spinning {
+            WARP_TICKS
+        } else {
+            0
+        }
+    }
+
+    /// Execute the instruction at `pc` (or one idle wait), including the
+    /// conditional-block skips and repeat-loop bookkeeping that follow it,
+    /// without advancing time or dispatching interrupts. Returns its pc.
+    fn execute_current(&mut self) -> Result<(u32, &'static str), Fault> {
         if let Some((at, end)) = self.predicate_skip {
             if self.pc == at {
                 self.pc = end;
@@ -368,7 +430,6 @@ impl Cpu {
             }
         }
         let pc = self.pc;
-        let polls_before = self.bus.timer_polls.get();
         let op = if self.idle {
             // Keep shared hardware time and the other core running while this
             // core waits. IRQ entry resumes at the instruction after IDLE.
@@ -376,14 +437,14 @@ impl Cpu {
         } else {
             let h = self
                 .bus
-                .fetch(pc)
+                .code(pc)
                 .map_err(|fault| Fault::Access { pc, fault })? as u32;
             let parallel = h >> 13 == 6 || h & 0xf800 == 0xf000;
             if parallel {
                 let length = if h >> 13 == 6 { 2 } else { 4 };
                 let normalized = if length == 2 { h & 0x1fff } else { h & !0x1000 };
                 self.pc = pc + length;
-                let following = self.read(self.pc, 2)?;
+                let following = self.code(self.pc)?;
                 let before = self.r;
                 let specials_before = self.sr;
                 self.execute(following)?;
@@ -462,27 +523,11 @@ impl Cpu {
                 }
             }
         }
-        self.steps += 1;
-        let mut ticks = if advance_time {
-            self.bus.instruction_ticks()
-        } else {
-            0
-        };
-        if advance_time && self.warp_allowed {
-            if self.idle {
-                ticks += WARP_TICKS;
-            } else if self.bus.timer_polls.get() != polls_before {
-                let (last_pc, last_steps, last_writes, last_irqs) = self.last_poll;
-                let spinning = last_pc == pc
-                    && self.steps - last_steps <= 64
-                    && self.bus.writes == last_writes
-                    && self.irq_entries == last_irqs;
-                self.last_poll = (pc, self.steps, self.bus.writes, self.irq_entries);
-                if spinning {
-                    ticks += WARP_TICKS;
-                }
-            }
-        }
+        Ok((pc, op))
+    }
+
+    /// Advance shared devices by `ticks` oscillator ticks of guest time.
+    fn advance_time(&mut self, ticks: u32, pc: u32) -> Result<(), Fault> {
         if ticks != 0 {
             self.bus.oscillator_ticks += ticks as u64;
             self.bus.advance_devices(ticks);
@@ -507,9 +552,7 @@ impl Cpu {
                 .advance_audio(ticks)
                 .map_err(|fault| Fault::Access { pc, fault })?;
         }
-        self.idle_wake_delay = self.idle_wake_delay.saturating_sub(1);
-        self.dispatch_interrupt()?;
-        Ok(op)
+        Ok(())
     }
 
     pub(crate) fn conditional(&mut self, test: bool, counts: u32) -> Result<u32, Fault> {
@@ -562,7 +605,7 @@ impl Cpu {
         let op;
         match self.decode.first(h) {
             First::MoveImmediate32 => {
-                let value = self.read(pc + 2, 2)? | (self.read(pc + 4, 2)? << 16);
+                let value = self.code(pc + 2)? | (self.code(pc + 4)? << 16);
                 let n = (h & 15) as usize;
                 if h & 0xfff0 == 0xffc0 {
                     self.r[n] = value;
@@ -613,7 +656,7 @@ impl Cpu {
                 op = "repeat_immediate";
             }
             First::MovSpecial => {
-                let extra = self.read(pc + 2, 2)?;
+                let extra = self.code(pc + 2)?;
                 let reg = ((extra >> 12) & 15) as usize;
                 let special = ((extra >> 8) & 15) as usize;
                 // Deliberately exclude PC writes and unrecognized reserved encodings.
@@ -632,7 +675,7 @@ impl Cpu {
                 op = "mov_special";
             }
             First::MovMask => {
-                let extra = self.read(pc + 2, 2)?;
+                let extra = self.code(pc + 2)?;
                 let mode = (extra >> 10) & 3;
                 if mode == 0 && extra & 0x0f00 > 0x0300 {
                     return Err(Fault::Unsupported { pc, word: h as u16 });
@@ -642,7 +685,7 @@ impl Cpu {
                 op = "mov_mask";
             }
             First::MovImm16 => {
-                self.r[(h & 15) as usize] = signed(self.read(pc + 2, 2)?, 16) as u32;
+                self.r[(h & 15) as usize] = signed(self.code(pc + 2)?, 16) as u32;
                 next = pc + 4;
                 op = "mov_imm16";
             }
@@ -725,7 +768,7 @@ impl Cpu {
                 }
             }
             First::StackMask => {
-                let mask = self.read(pc + 2, 2)?;
+                let mask = self.code(pc + 2)?;
                 next = pc + 4;
                 if h & 4 == 0 {
                     if h & 1 != 0 {
@@ -841,13 +884,13 @@ impl Cpu {
             }
             First::CallRel32 => {
                 // Vendor startup uses a signed byte displacement after a 6-byte call.
-                let displacement = self.read(pc + 2, 2)? | (self.read(pc + 4, 2)? << 16);
+                let displacement = self.code(pc + 2)? | (self.code(pc + 4)? << 16);
                 self.sr[3] = pc + 6;
                 next = (pc + 6).wrapping_add(displacement);
                 op = "call_rel32";
             }
             First::Relative22 => {
-                let displacement = signed(((h & 63) << 16) | self.read(pc + 2, 2)?, 22) * 2;
+                let displacement = signed(((h & 63) << 16) | self.code(pc + 2)?, 22) * 2;
                 if h & 0xffc0 == 0xea80 {
                     self.sr[3] = pc + 4;
                     op = "call_rel22";

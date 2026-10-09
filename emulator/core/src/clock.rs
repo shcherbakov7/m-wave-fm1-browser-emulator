@@ -74,6 +74,29 @@ impl Clock {
         self.instruction_phase %= hz as u64;
         ticks as u32
     }
+    /// Oscillator ticks for `count` consecutive instruction issues; the same
+    /// total as `count` calls to `instruction_ticks`.
+    pub(crate) fn instruction_ticks_n(&mut self, clk_con3: u32, count: u64) -> u64 {
+        if count == 1 {
+            return self.instruction_ticks(clk_con3) as u64;
+        }
+        let hz = match self.issue_clock {
+            Some((selector, hz)) if selector == clk_con3 => hz,
+            _ => {
+                let hz = self.system_hz(clk_con3).max(1);
+                self.issue_clock = Some((clk_con3, hz));
+                hz
+            }
+        };
+        if hz != self.phase_hz {
+            self.instruction_phase = self.instruction_phase * hz as u64 / self.phase_hz as u64;
+            self.phase_hz = hz;
+        }
+        self.instruction_phase += 24_000_000 * count;
+        let ticks = self.instruction_phase / hz as u64;
+        self.instruction_phase %= hz as u64;
+        ticks
+    }
     fn register(&self, a: u32) -> Option<&u32> {
         match a {
             0x10200 => Some(&0x6f01), // Physical FM-1 chip revision, read-only.

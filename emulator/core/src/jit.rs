@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+#![cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(unused))]
 // Small native backend for prepared register operations. Every entry returns
 // after one guest instruction, retaining device/IRQ and dual-core boundaries.
 use crate::blocks::Op;

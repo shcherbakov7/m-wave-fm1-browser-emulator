@@ -17,6 +17,9 @@ pub struct Nor {
     write_enabled: bool,
     busy_ticks: u32,
     pending: Option<Pending>,
+    /// Bumped whenever what XIP returns could change (register writes, busy
+    /// start/end, program/erase, load). Instruction-word caches compare it.
+    pub(crate) generation: u32,
 }
 
 impl Default for Nor {
@@ -32,6 +35,7 @@ impl Default for Nor {
             write_enabled: false,
             busy_ticks: 0,
             pending: None,
+            generation: 0,
         }
     }
 }
@@ -56,6 +60,7 @@ impl Nor {
         self.decoded = Some(decoded);
         self.key = key;
         self.regs[..3].copy_from_slice(&[0x809803b5, 1, 0x8e17]);
+        self.generation = self.generation.wrapping_add(1);
     }
     pub fn packaged(&self) -> bool {
         self.decoded.is_some()
@@ -143,21 +148,27 @@ impl Nor {
                 let address = ((*a as usize) << 16) | ((*b as usize) << 8) | *c as usize;
                 self.pending = Some(Pending::Program(address % self.bytes.len(), data.to_vec()));
                 self.busy_ticks = 48_000;
+                self.generation = self.generation.wrapping_add(1);
             }
             [0x20, a, b, c] if self.write_enabled => {
                 let address = ((*a as usize) << 16) | ((*b as usize) << 8) | *c as usize;
                 self.pending = Some(Pending::Erase(address % self.bytes.len() & !0xfff));
                 self.busy_ticks = 192_000;
+                self.generation = self.generation.wrapping_add(1);
             }
             _ => {}
         }
     }
 
     pub(crate) fn advance(&mut self, ticks: u32) {
+        if self.busy_ticks == 0 && self.pending.is_none() {
+            return;
+        }
         self.busy_ticks = self.busy_ticks.saturating_sub(ticks);
         if self.busy_ticks != 0 {
             return;
         }
+        self.generation = self.generation.wrapping_add(1);
         let (start, end) = match self.pending.take() {
             Some(Pending::Program(address, data)) => {
                 let page = address & !255;
@@ -188,6 +199,7 @@ impl Nor {
     }
     pub fn write(&mut self, a: u32, v: u32) -> Option<Result<(), &'static str>> {
         self.read(a)?;
+        self.generation = self.generation.wrapping_add(1);
         if (a == 0x40304 && v != 0) || ((a == 0x40310 || a == 0x40314) && v != 0) {
             return Some(Err(
                 "SFC dynamic key and encrypted-window changes are not implemented",

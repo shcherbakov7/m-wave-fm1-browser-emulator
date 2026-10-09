@@ -38,7 +38,17 @@ fn run() -> Result<(), String> {
     let mut serial_bytes = 0u64;
     let mut stdout = io::stdout().lock();
     let mut fault = None;
-    for _ in 0..limit {
+    if env::var_os("DIAG_FAST").is_some() {
+        // Batched execution as used by the browser; no per-step history.
+        if let Err(error) = cpu.step_many(limit) {
+            fault = Some(error);
+        }
+        while let Some(byte) = cpu.bus.usb.serial.pop_front() {
+            stdout.write_all(&[byte]).map_err(|e| e.to_string())?;
+            serial_bytes += 1;
+        }
+    }
+    for _ in 0..if fault.is_some() || env::var_os("DIAG_FAST").is_some() { 0 } else { limit } {
         let pc = cpu.pc;
         match cpu.step() {
             Ok(op) => {

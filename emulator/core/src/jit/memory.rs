@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(unused))]
 // Own executable pages separately from the Rust heap. Write once, then RX;
 // never retain writable executable memory. Allocation denial uses the interpreter.
 use std::ffi::c_void;

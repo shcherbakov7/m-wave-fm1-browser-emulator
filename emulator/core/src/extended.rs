@@ -181,7 +181,7 @@ pub(crate) fn execute(
             op = "memory_postincrement";
         }
         Extended::Wide => {
-            let x = cpu.read(pc + 2, 2)?;
+            let x = cpu.code(pc + 2)?;
             let n = (h & 15) as usize;
             let d = (x >> 12) as usize;
             let s = ((x >> 4) & 15) as usize;
@@ -579,7 +579,7 @@ pub(crate) fn execute(
                     };
                     next = pc + 6;
                     if test {
-                        next = next.wrapping_add((signed(cpu.read(pc + 4, 2)?, 16) * 2) as u32);
+                        next = next.wrapping_add((signed(cpu.code(pc + 4)?, 16) * 2) as u32);
                     }
                     op = "branch_long";
                 }

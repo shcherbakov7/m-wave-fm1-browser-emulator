@@ -111,7 +111,21 @@ pub struct Bus {
     pub(crate) timer_polls: std::cell::Cell<u64>,
     /// Guest writes of any kind, for recognizing side-effect-free loops.
     pub(crate) writes: u64,
+    /// Accesses that reached device registers (not SRAM or XIP); batches
+    /// end after one so devices are brought up to date.
+    pub(crate) device_accesses: std::cell::Cell<u64>,
+    /// Direct-mapped cache of XIP instruction halfwords, tagged with the
+    /// address and the NOR generation in force when they were read.
+    code_cache: Box<[CodeEntry]>,
 }
+
+#[derive(Clone, Copy)]
+struct CodeEntry {
+    address: u32,
+    generation: u32,
+    word: u16,
+}
+const CODE_SLOTS: usize = 1 << 16;
 
 impl Bus {
     pub(crate) fn core_control(&self, core: usize) -> u32 {
@@ -152,6 +166,16 @@ impl Bus {
             oscillator_ticks: 0,
             timer_polls: Default::default(),
             writes: 0,
+            device_accesses: Default::default(),
+            code_cache: vec![
+                CodeEntry {
+                    address: u32::MAX,
+                    generation: 0,
+                    word: 0
+                };
+                CODE_SLOTS
+            ]
+            .into_boxed_slice(),
         })
     }
 
@@ -219,6 +243,7 @@ impl Bus {
         } else if let Some(offset) = Self::offset(address, size, RAM, self.ram.len()) {
             &self.ram[offset..offset + size]
         } else {
+            self.device_accesses.set(self.device_accesses.get() + 1);
             if let Some(value) = self.shift_spi.read(address & !3) {
                 return if size == 4 {
                     Ok(value)
@@ -312,7 +337,36 @@ impl Bus {
         self.read_as(address, size, "read")
     }
 
+    /// Read an instruction halfword (opcode or operand) for execution.
+    /// SRAM is read directly; XIP words come from the code cache while the
+    /// NOR generation is unchanged, otherwise through the full checked path.
+    pub fn code(&mut self, address: u32) -> Result<u16, AccessFault> {
+        if let Some(offset) = Self::offset(address, 2, RAM, self.ram.len()) {
+            if address & 1 == 0 {
+                return Ok(u16::from_le_bytes([self.ram[offset], self.ram[offset + 1]]));
+            }
+        }
+        let slot = (address >> 1) as usize & (CODE_SLOTS - 1);
+        let entry = self.code_cache[slot];
+        if entry.address == address && entry.generation == self.nor.generation {
+            return Ok(entry.word);
+        }
+        let word = self.read_as(address, 2, "fetch")? as u16;
+        if Self::offset(address, 2, XIP, self.flash.len()).is_some() {
+            self.code_cache[slot] = CodeEntry {
+                address,
+                generation: self.nor.generation,
+                word,
+            };
+        }
+        Ok(word)
+    }
+
     pub fn fetch(&self, address: u32) -> Result<u16, AccessFault> {
+        let entry = self.code_cache[(address >> 1) as usize & (CODE_SLOTS - 1)];
+        if entry.address == address && entry.generation == self.nor.generation {
+            return Ok(entry.word);
+        }
         // Fast path for the common case, packaged XIP: same checks as read_as
         // (XIP window, SFC state, encryption) without the device chain.
         if address & 1 == 0 && self.nor.packaged() && Self::offset(address, 2, XIP, self.flash.len()).is_some() {
@@ -334,6 +388,7 @@ impl Bus {
             self.ram[offset..offset + size].copy_from_slice(&value.to_le_bytes()[..size]);
             return Ok(());
         }
+        self.device_accesses.set(self.device_accesses.get() + 1);
         if let Some(result) = self.devices.write_uart(address, value, size, &self.ram) {
             return result.map_err(|reason| Self::fault(address, size, "write", reason));
         }
@@ -488,6 +543,16 @@ impl Bus {
             self.devices.gpio.shift_spi(&bytes);
         }
     }
+    pub(crate) fn instruction_ticks_n(&mut self, count: u64) -> u64 {
+        self.clock
+            .instruction_ticks_n(self.audio.read(0x10014).unwrap(), count)
+    }
+
+    /// Changes whenever cached XIP instruction words may be stale.
+    pub(crate) fn code_generation(&self) -> u32 {
+        self.nor.generation
+    }
+
     pub(crate) fn instruction_ticks(&mut self) -> u32 {
         self.clock
             .instruction_ticks(self.audio.read(0x10014).unwrap())

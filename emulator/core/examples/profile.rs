@@ -15,14 +15,25 @@ fn main() -> Result<(), String> {
     let mut ops: HashMap<&'static str, u64> = HashMap::new();
     let start = Instant::now();
     let mut fault = None;
-    for _ in 0..limit {
-        match cpu.step() {
-            Ok(op) if count_ops => *ops.entry(op).or_default() += 1,
-            Ok(_) => {}
-            Err(error) => {
-                fault = Some(error.to_string());
-                break;
+    if count_ops {
+        for _ in 0..limit {
+            match cpu.step() {
+                Ok(op) => *ops.entry(op).or_default() += 1,
+                Err(error) => {
+                    fault = Some(error.to_string());
+                    break;
+                }
             }
+        }
+    } else {
+        if env::var_os("PROFILE_UNBATCHED").is_some() {
+            cpu.unbatched_ops = Some(HashMap::new());
+        }
+        if let Err(error) = cpu.step_many(limit) {
+            fault = Some(error.to_string());
+        }
+        if let Some(unbatched) = cpu.unbatched_ops.take() {
+            ops = unbatched;
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -33,6 +44,7 @@ fn main() -> Result<(), String> {
         cpu.steps as f64 / 1e6 / elapsed,
         guest / elapsed
     );
+    println!("batched: {:.1}%", cpu.batched_steps as f64 * 100.0 / cpu.steps.max(1) as f64);
     let mut sorted: Vec<_> = ops.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     for (op, count) in sorted.iter().take(25) {
