@@ -11,11 +11,13 @@
   <header class="bar">
     <h1>FM-1 <span>эмулятор</span></h1>
     <div class="actions">
-      <label class="button primary" title="Открыть файл прошивки (.fwsc, .ufw, .bin, .elf)">
-        Загрузить прошивку
+      <select id="firmware" class="primary" title="Готовые прошивки и ранее загруженные файлы">
+        <option value="">Выбрать прошивку…</option>
+      </select>
+      <label class="button" title="Открыть свой файл прошивки (.fwsc, .ufw, .bin, .elf)">
+        Свой файл
         <input id="file" type="file" accept=".fwsc,.ufw,.bin,.elf" hidden>
       </label>
-      <select id="recent" title="Ранее загруженные прошивки"><option value="">Недавние…</option></select>
       <button id="pause" class="button" disabled>Пауза</button>
       <button id="restart" class="button" disabled>Перезапуск</button>
       <button id="sound" class="button" title="Включить звук">🔇 Звук</button>
@@ -25,12 +27,13 @@
   <main>
     <section id="device" class="device" aria-label="Панель FM-1">
       <div id="lcd-frame" class="lcd-frame"><canvas id="lcd" width="240" height="240" aria-label="Экран"></canvas>
-        <div id="drop-hint" class="drop-hint">Перетащите сюда файл прошивки<br><small>.fwsc · .ufw · .bin · .elf</small></div>
+        <div id="drop-hint" class="drop-hint">Выберите прошивку в списке сверху<br><small>или перетащите сюда свой файл .fwsc</small></div>
       </div>
     </section>
 
     <section class="info">
       <div id="state" class="state">Нет прошивки</div>
+      <div id="about" class="about" hidden></div>
       <dl class="stats">
         <div><dt>Скорость</dt><dd id="speed">—</dd></div>
         <div><dt>Шаги CPU</dt><dd id="steps">—</dd></div>

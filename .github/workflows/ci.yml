@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  # Daily rebuild: the site picks up new releases of the open firmwares.
+  schedule:
+    - cron: "17 4 * * *"
 
 permissions:
   contents: read
@@ -23,10 +26,13 @@ jobs:
         run: cargo test --release --manifest-path emulator/Cargo.toml
       - name: Build WebAssembly
         run: tools/build-web.sh
+      - name: Fetch the newest open firmwares
+        run: node tools/update-firmware.mjs
       - name: Package site
         run: |
           mkdir -p _site
           cp web/*.html web/*.css web/*.js web/fm1.wasm _site/
+          cp -r web/firmware _site/
           cp LICENSE _site/
       - uses: actions/upload-pages-artifact@v3
         with:
