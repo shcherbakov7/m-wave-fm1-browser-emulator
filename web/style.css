@@ -33,6 +33,12 @@ a { color: var(--accent); }
 .button:hover:not(:disabled) { border-color: #5a606a; }
 .button:disabled { opacity: .45; cursor: default; }
 .button.primary { background: var(--accent); color: #1b1b1b; border-color: var(--accent); font-weight: 600; }
+/* Language switch: two joined buttons, the current one highlighted. */
+.lang { display: inline-flex; }
+.lang .button { padding: 7px 9px; font-size: 13px; }
+.lang .button:first-child { border-radius: 8px 0 0 8px; }
+.lang .button:last-child { border-radius: 0 8px 8px 0; margin-left: -1px; }
+.lang .button[aria-pressed="true"] { background: #3a3e45; border-color: #5a606a; font-weight: 600; }
 [hidden] { display: none !important; }
 main {
   display: grid; gap: 16px; padding: 16px;
@@ -222,6 +228,9 @@ select.primary option, select.primary optgroup { background: var(--panel); color
   .actions #firmware { grid-column: 1 / -1; }
   .actions label.button { display: none; }   /* own files: in the firmware card */
   .actions .button, .actions select { padding: 8px 6px; text-align: center; }
+  .bar { position: relative; }
+  .actions .lang { position: absolute; top: 8px; right: 12px; }  /* beside the title */
+  .actions .lang .button { padding: 5px 9px; }
 }
 .engine { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .engine-warn { color: #ffd5d1; }

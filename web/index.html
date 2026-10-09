@@ -1,73 +1,64 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>FM-1 Emulator</title>
-  <meta name="description" content="Браузерный эмулятор M-VAVE FM-1: запускает немодифицированные прошивки .fwsc">
+  <meta name="description" content="Browser emulator of the M-VAVE FM-1: runs unmodified .fwsc firmware">
   <link rel="stylesheet" href="style.css?v=__BUILD__">
 </head>
 <body>
   <header class="bar">
-    <h1>FM-1 <span>эмулятор</span></h1>
+    <h1>FM-1 <span data-i18n="title.suffix">emulator</span></h1>
     <div class="actions">
-      <select id="firmware" class="primary" title="Готовые прошивки и ранее загруженные файлы">
-        <option value="">Выбрать прошивку…</option>
+      <select id="firmware" class="primary" data-i18n-title="firmware.title">
+        <option value="" data-i18n="firmware.choose">Choose firmware…</option>
       </select>
-      <label class="button" title="Открыть свой файл прошивки (.fwsc, .ufw, .bin, .elf)">
-        Свой файл
+      <label class="button" data-i18n-title="file.title">
+        <span data-i18n="file.button">Own file</span>
         <input id="file" type="file" accept=".fwsc,.ufw,.bin,.elf" hidden>
       </label>
-      <button id="pause" class="button" disabled>Пауза</button>
-      <button id="restart" class="button" disabled>Перезапуск</button>
-      <button id="sound" class="button" title="Включить звук">🔇 Звук</button>
+      <button id="pause" class="button" disabled>Pause</button>
+      <button id="restart" class="button" disabled data-i18n="restart">Restart</button>
+      <button id="sound" class="button" data-i18n-title="sound.title">🔇 Sound</button>
+      <div id="lang" class="lang" role="group" data-i18n-aria-label="lang.label"></div>
     </div>
   </header>
 
   <main>
-    <section id="device" class="device" aria-label="Панель FM-1">
-      <div id="lcd-frame" class="lcd-frame"><canvas id="lcd" width="240" height="240" aria-label="Экран"></canvas>
-        <div id="drop-hint" class="drop-hint">Выберите прошивку в списке сверху<br><small>или перетащите сюда свой файл .fwsc</small></div>
+    <section id="device" class="device" data-i18n-aria-label="device.label">
+      <div id="lcd-frame" class="lcd-frame"><canvas id="lcd" width="240" height="240" data-i18n-aria-label="lcd.label"></canvas>
+        <div id="drop-hint" class="drop-hint" data-i18n-html="drop.hint"></div>
       </div>
     </section>
 
     <section class="info">
       <section class="firmware-card" aria-labelledby="firmware-title">
-        <h2 id="firmware-title">Прошивки</h2>
+        <h2 id="firmware-title" data-i18n="list.title">Firmware</h2>
         <div id="firmware-list" class="firmware-list"></div>
       </section>
-      <div id="state" class="state">Нет прошивки</div>
+      <div id="state" class="state">No firmware</div>
       <div id="about" class="about" hidden></div>
       <dl class="stats">
-        <div><dt>Скорость</dt><dd id="speed">—</dd></div>
-        <div><dt>Шаги CPU</dt><dd id="steps">—</dd></div>
-        <div><dt>Время устройства</dt><dd id="guest-time">—</dd></div>
-        <div><dt>Прерывания</dt><dd id="irqs">—</dd></div>
+        <div><dt data-i18n="stats.speed">Speed</dt><dd id="speed">—</dd></div>
+        <div><dt data-i18n="stats.steps">CPU steps</dt><dd id="steps">—</dd></div>
+        <div><dt data-i18n="stats.time">Device time</dt><dd id="guest-time">—</dd></div>
+        <div><dt data-i18n="stats.irqs">Interrupts</dt><dd id="irqs">—</dd></div>
       </dl>
       <p id="engine" class="engine"></p>
       <details class="help" open>
-        <summary>Управление</summary>
-        <p>Кнопки и клавиши — мышью или касанием (удерживайте; по клавишам можно вести пальцем). Ручки — тяните вверх/вниз, крутите колёсико мыши или стрелками, наведя фокус. MASTER — громкость, остальные семь ручек — энкодеры.</p>
-        <p>Клавиатура компьютера:</p>
-        <ul>
-          <li><kbd>Z</kbd>…<kbd>/</kbd> и <kbd>S</kbd> <kbd>D</kbd> <kbd>F</kbd> <kbd>H</kbd> <kbd>J</kbd> <kbd>L</kbd> <kbd>;</kbd> — клавиши с F3</li>
-          <li><kbd>1</kbd> <kbd>Q</kbd>…<kbd>Y</kbd> и <kbd>3</kbd> <kbd>4</kbd> <kbd>6</kbd> — верхняя часть</li>
-          <li><kbd>←</kbd> <kbd>→</kbd> — OCT− / OCT+, <kbd>Esc</kbd> — HOME, <kbd>Пробел</kbd> — PLAY/STOP</li>
-        </ul>
-        <p class="note">Подсветка кнопок и клавиш повторяет светодиоды устройства.</p>
+        <summary data-i18n="help.title">Controls</summary>
+        <div data-i18n-html="help.html"></div>
       </details>
       <details class="console">
-        <summary>USB-консоль прошивки</summary>
+        <summary data-i18n="console.title">Firmware USB console</summary>
         <pre id="serial"></pre>
-        <form id="serial-form"><input id="serial-input" placeholder="команда (например help) и Enter" autocomplete="off"></form>
+        <form id="serial-form"><input id="serial-input" data-i18n-placeholder="console.placeholder" autocomplete="off"></form>
       </details>
     </section>
   </main>
 
-  <footer>
-    GPL-3.0 · Ядро основано на <a href="https://github.com/simonjohansson/fm1-emulator">fm1-emulator</a> ·
-    Прошивки не входят в комплект, загружайте свои.
-  </footer>
+  <footer data-i18n-html="footer.html"></footer>
   <script src="app.js?v=__BUILD__" type="module"></script>
 </body>
 </html>

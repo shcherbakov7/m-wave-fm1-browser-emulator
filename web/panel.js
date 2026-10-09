@@ -47,7 +47,8 @@ const DRAG_PIXELS_PER_DETENT = 9;
  *   onControl(id, down), onEncoder(index, steps), onMaster(value 0..1023).
  * Returns { setLeds(Uint8Array), releaseAll(), press(id, source, down), keyIds }.
  */
-export function createPanel(device, { onControl, onEncoder, onMaster, keyHints = new Map() }) {
+export function createPanel(device, { onControl, onEncoder, onMaster, t, keyHint = () => "" }) {
+  const labels = []; // functions that set titles and labels in the current language
   const controls = new Map(); // id -> element
   const held = new Map();     // id -> Set of sources holding it
 
@@ -86,9 +87,10 @@ export function createPanel(device, { onControl, onEncoder, onMaster, keyHints =
       if (!steps) return;
       if (knob.encoder === undefined) {
         master = Math.max(0, Math.min(MASTER_MAX, master + steps * 16));
+        touched = true;
         angle = -MASTER_SWEEP / 2 + (MASTER_SWEEP * master) / MASTER_MAX;
         element.setAttribute("aria-valuenow", String(master));
-        element.title = `MASTER: ${Math.round((master / MASTER_MAX) * 100)}% — тяните вверх/вниз или крутите колёсико`;
+        describe();
         onMaster(master);
       } else {
         angle += steps * DETENT_DEGREES;
@@ -96,14 +98,18 @@ export function createPanel(device, { onControl, onEncoder, onMaster, keyHints =
       }
       draw();
     };
+    let touched = false; // MASTER shows its level once turned
+    const describe = () => {
+      if (knob.encoder !== undefined) element.title = t("panel.encoder", { name: knob.name });
+      else element.title = touched ? t("panel.master-value", { pct: Math.round((master / MASTER_MAX) * 100) }) : t("panel.master");
+    };
+    labels.push(describe);
     if (knob.encoder === undefined) {
       element.setAttribute("aria-valuemin", "0");
       element.setAttribute("aria-valuemax", String(MASTER_MAX));
       element.setAttribute("aria-valuenow", String(master));
-      element.title = "MASTER (громкость) — тяните вверх/вниз или крутите колёсико";
-    } else {
-      element.title = `${knob.name} — энкодер: тяните вверх/вниз или крутите колёсико`;
     }
+    describe();
     draw();
 
     // Drag: up or right is clockwise.
@@ -151,19 +157,22 @@ export function createPanel(device, { onControl, onEncoder, onMaster, keyHints =
     button.className = `ctl ${kind}`;
     button.dataset.id = id;
     if (LED_COLOR[id]) button.dataset.led = LED_COLOR[id];
-    const hint = keyHints.get(id);
+    const shortcut = () => (keyHint(id) ? ` — ${t("panel.shortcut", { key: keyHint(id) })}` : "");
     if (kind.startsWith("btn")) {
       button.append(div("legend", label));
       button.setAttribute("aria-label", label.replace("\n", " / "));
-      if (hint) button.title = `${label.replace("\n", "/")} — клавиша ${hint}`;
+      labels.push(() => { if (keyHint(id)) button.title = `${label.replace("\n", "/")}${shortcut()}`; });
     } else {
       button.append(div("groove"));
       if (label) button.append(div("legend", label));
       const n = id - ID.NOTE;
       const name = `${NOTE_NAMES[n % 12]}${3 + Math.floor((n + 5) / 12)}`;
-      button.setAttribute("aria-label", `Клавиша ${name}${label ? ` (${label})` : ""}`);
-      button.title = `${name}${label ? ` · ${label}` : ""}${hint ? ` — клавиша ${hint}` : ""}`;
+      labels.push(() => {
+        button.setAttribute("aria-label", `${t("panel.key", { name })}${label ? ` (${label})` : ""}`);
+        button.title = `${name}${label ? ` · ${label}` : ""}${shortcut()}`;
+      });
     }
+    labels.at(-1)();
     controls.set(id, place(button, x, y, w, h));
   };
   control(ID.OCT_DOWN, "OCT−", [64, 322, 78, 42], "btn oct");
@@ -248,5 +257,7 @@ export function createPanel(device, { onControl, onEncoder, onMaster, keyHints =
     }
   }
 
-  return { setLeds, releaseAll, press };
+  /** Set titles and labels again after a language switch. */
+  const relabel = () => { for (const label of labels) label(); };
+  return { setLeds, releaseAll, press, relabel };
 }

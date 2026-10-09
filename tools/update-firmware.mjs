@@ -6,7 +6,7 @@
 // (GITHUB_TOKEN, when set, raises its rate limit).
 //
 // Only firmwares whose authors publish the .fwsc in their repository under a
-// free licence are copied. The official M-VAVE firmware is not copied: the
+// free licence are copied. Descriptions are given per interface language. The official M-VAVE firmware is not copied: the
 // page loads it from M-VAVE's own server.
 //
 // Usage: node tools/update-firmware.mjs [out-dir]
@@ -21,61 +21,61 @@ const SOURCES = [
   {
     id: "felucca", name: "Felucca", author: "Leo Kuroshita (Hügelton Instruments)",
     repo: "hugelton/Felucca", branch: "gh-pages", pattern: /^firmware\/felucca-([\d.]+)\.fwsc$/,
-    description: "Многодвижковый синтезатор: 13 движков, четыре дорожки, секвенсор, песни.",
+    description: { en: "Multi-engine synthesizer: 13 engines, four tracks, sequencer, songs.", ru: "Многодвижковый синтезатор: 13 движков, четыре дорожки, секвенсор, песни." },
   },
   {
     id: "sloop", name: "SLOOP", author: "3dSam",
     repo: "isod89/sloop-fm1", branch: "main", pattern: /^docs\/firmware\/sloop-([\d.]+)\.fwsc$/,
-    description: "Четырёхдорожечный грувбокс: три синтезатора и драм-машина.",
+    description: { en: "Four-track groovebox: three synths and a drum machine.", ru: "Четырёхдорожечный грувбокс: три синтезатора и драм-машина." },
   },
   {
     id: "x0x", name: "X0X", author: "Charles Vestal",
     repo: "charlesvestal/fm1-x0x", branch: "gh-pages", pattern: /^firmware\/x0x-([\w.-]+)\.fwsc$/,
-    description: "Грувбокс в духе ReBirth: TR-909, TR-808 и два TB-303.",
+    description: { en: "ReBirth-style groovebox: TR-909, TR-808 and two TB-303s.", ru: "Грувбокс в духе ReBirth: TR-909, TR-808 и два TB-303." },
   },
   {
     id: "melodee", name: "Melodee", author: "keremimo",
     repo: "keremimo/melodee", branch: "gh-pages", pattern: /^firmware\/melodee-([\d.]+)\.fwsc$/,
-    description: "Десять движков, восемь паттернов на дорожку, рабочие пространства STUDIO.",
+    description: { en: "Ten engines, eight patterns per track, STUDIO workspaces.", ru: "Десять движков, восемь паттернов на дорожку, рабочие пространства STUDIO." },
   },
   {
     id: "fomni", name: "FoMni", author: "Charles Vestal",
     repo: "charlesvestal/fm1-fomni", branch: "gh-pages", pattern: /^firmware\/omni-([\d.]+)\.fwsc$/,
-    description: "Омникорд: аккорды под одной рукой, струнная пластина под другой.",
+    description: { en: "Omnichord: chords under one hand, a strum plate under the other.", ru: "Омникорд: аккорды под одной рукой, струнная пластина под другой." },
   },
   {
     id: "jangada", name: "Jangada", author: "zednaked",
     repo: "zednaked/jangada", release: /\.(fwsc|ufw)$/i,
-    description: "Ветка Felucca: superwave, матрица модуляции, дроны, рэтчеты, синтез-ударные.",
+    description: { en: "A Felucca fork: superwave, mod matrix, drones, ratchets, synth drums.", ru: "Ветка Felucca: superwave, матрица модуляции, дроны, рэтчеты, синтез-ударные." },
   },
   {
     id: "choralroot", name: "ChoralRoot", author: "Quixotic7",
     repo: "Quixotic7/ChoralRootFM1", release: /\.(fwsc|ufw)$/i,
-    description: "Аккордовый инструмент в духе Telepathic Orchid: корни одной рукой, аккорды другой.",
+    description: { en: "Chord instrument in the spirit of Telepathic Orchid: roots with one hand, chords with the other.", ru: "Аккордовый инструмент в духе Telepathic Orchid: корни одной рукой, аккорды другой." },
   },
   {
     id: "fimba", name: "FiMba", author: "jadamsowers",
     repo: "jadamsowers/fm1-fimba", release: /\.(fwsc|ufw)$/i,
-    description: "Калимба (пианино для больших пальцев) на FM-1.",
+    description: { en: "Kalimba (thumb piano) for the FM-1.", ru: "Калимба (пианино для больших пальцев) на FM-1." },
   },
   {
     id: "nes", name: "fm1-nes", author: "Keitark", license: "Apache-2.0",
     repo: "Keitark/fm1-nes", release: /\.(fwsc|ufw)$/i,
-    description: "Эмулятор NES на FM-1 (пример разработки своей прошивки).",
+    description: { en: "NES emulator on the FM-1 (an example of custom firmware development).", ru: "Эмулятор NES на FM-1 (пример разработки своей прошивки)." },
   },
   {
     id: "sloop-alg", name: "SLOOP ALG", author: "shaw-core",
     repo: "shaw-core/Sloop_ALG02", branch: "main", pattern: /^firmware\/sloop-(ALG\d+)-TEST\.fwsc$/,
-    description: "Экспериментальная ветка SLOOP с движками DX7, VA, Karplus-Strong.",
+    description: { en: "Experimental SLOOP branch with DX7, VA and Karplus-Strong engines.", ru: "Экспериментальная ветка SLOOP с движками DX7, VA, Karplus-Strong." },
   },
 ];
 
 const OFFICIAL = {
-  id: "official", name: "Официальная M-VAVE", version: "V15", author: "M-VAVE",
+  id: "official", name: { en: "Official M-VAVE", ru: "Официальная M-VAVE" }, version: "V15", author: "M-VAVE",
   url: "https://yms-file-store.oss-cn-hongkong.aliyuncs.com/software/firmware/FM-1.fwsc",
   page: "https://www.m-vave.com/download",
-  license: "проприетарная, загружается с сервера M-VAVE",
-  description: "Заводская прошивка: 6-операторный FM в духе DX7, эффекты, арпеджиатор, секвенсор.",
+  license: { en: "proprietary, loaded from the M-VAVE server", ru: "проприетарная, загружается с сервера M-VAVE" },
+  description: { en: "Factory firmware: 6-operator DX7-style FM, effects, arpeggiator, sequencer.", ru: "Заводская прошивка: 6-операторный FM в духе DX7, эффекты, арпеджиатор, секвенсор." },
 };
 
 /** Compare dotted versions numerically, part by part. */
