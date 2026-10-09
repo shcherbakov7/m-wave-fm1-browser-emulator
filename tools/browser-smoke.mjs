@@ -45,6 +45,11 @@ while (Date.now() < deadline) {
   const parsed = JSON.parse(state);
   if (parsed.state.startsWith("Остановлено") || parsed.state.startsWith("Ошибка") || parsed.lit > 2000) break;
 }
+// SETTLE=seconds: keep running after boot, then report the speed again.
+if (process.env.SETTLE) {
+  await page.waitForTimeout(Number(process.env.SETTLE) * 1000);
+  state = await page.evaluate(() => JSON.stringify({ steps: document.getElementById("steps").textContent, speed: document.getElementById("speed").textContent, load: document.getElementById("speed").title, guest: document.getElementById("guest-time").textContent }));
+}
 for (const id of presses) {
   await page.locator(`.ctl[data-id="${id}"]`).click();
   await page.waitForTimeout(8000);

@@ -100,6 +100,8 @@ pub struct Stats {
     pub failed: u32,
     pub translated_steps: u64,
     pub block_calls: u64,
+    /// Times flash or SRAM translations were dropped as stale.
+    pub flushes: u64,
 }
 
 /// Interpreter calls made by translated blocks.
@@ -189,6 +191,7 @@ impl Jit {
         let xip = |pc: u32| (fm1_emu::XIP..fm1_emu::XIP_END).contains(&pc);
         let sram = cpu.bus.sram_code_generation();
         if sram != self.sram_generation {
+            self.stats.flushes += 1;
             self.release_where(|pc| !xip(pc));
             self.sram_generation = sram;
         }
@@ -196,6 +199,7 @@ impl Jit {
         if generation == self.generation {
             self.xip_chain_off = false;
         } else if cpu.bus.xip_active() {
+            self.stats.flushes += 1;
             self.release_where(xip);
             self.generation = generation;
             self.xip_chain_off = false;

@@ -320,7 +320,7 @@ pub extern "C" fn fm1_status() -> usize {
                 #[cfg(target_arch = "wasm32")]
                 let jit = format!(
                     "{{\"enabled\":{},\"chaining\":{},\"compiled\":{},\"failed\":{},\"translatedSteps\":{},\
-                     \"blockCalls\":{},\"execCalls\":{},\"batchedSteps\":{}}}",
+                     \"blockCalls\":{},\"execCalls\":{},\"batchedSteps\":{},\"flushes\":{}}}",
                     m.jit.enabled,
                     m.jit.chaining,
                     m.jit.stats.compiled,
@@ -329,7 +329,8 @@ pub extern "C" fn fm1_status() -> usize {
                     m.jit.stats.block_calls,
                     // SAFETY: plain read on the single host thread.
                     unsafe { *std::ptr::addr_of!(jit::EXEC_CALLS) },
-                    cpu.batched_steps
+                    cpu.batched_steps,
+                    m.jit.stats.flushes
                 );
                 #[cfg(not(target_arch = "wasm32"))]
                 let jit = "null".to_string();

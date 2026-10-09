@@ -21,9 +21,10 @@ const total = Number(stepsArg);
 const start = performance.now();
 let status = 0;
 let half = null; // { time, guest } once half the steps ran: steady-state speed excludes warm-up
-for (let done = 0; done < total && status === 0; done += 4_000_000) {
+const CHUNK = Number(process.env.CHUNK ?? 4_000_000);
+for (let done = 0; done < total && status === 0; done += CHUNK) {
   if (!half && done >= total / 2) half = { time: performance.now(), guest: x.fm1_guest_seconds() };
-  status = x.fm1_run(Math.min(4_000_000, total - done));
+  status = x.fm1_run(Math.min(CHUNK, total - done));
   // PROFILE_EXEC_AFTER=steps: count interpreter calls only after warm-up.
   if (process.env.PROFILE_EXEC_AFTER && done < Number(process.env.PROFILE_EXEC_AFTER) && done + 4_000_000 >= Number(process.env.PROFILE_EXEC_AFTER)) x.fm1_profile_exec(1);
 }

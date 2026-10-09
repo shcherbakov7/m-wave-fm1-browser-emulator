@@ -147,10 +147,7 @@ function wake() {
   schedule();
 }
 
-onmessage = slice;
-function schedule() { channel.port2.postMessage(0); }
-
-onmessage = ({ data }) => {
+onmessage =({ data }) => {
   switch (data.type) {
     case "init": init(data.wasmUrl).catch((error) => postMessage({ type: "error", message: String(error) })); break;
     case "load": load(data.bytes, data.name); break;
