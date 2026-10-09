@@ -141,6 +141,11 @@ pub struct Jit {
     chain: Vec<[u32; 2]>,
     /// Whether the host supports tail calls, which chaining needs.
     pub chaining: bool,
+    /// Most translated blocks alive at once (engines with a small
+    /// executable-memory pool, such as WebKit on iOS); further blocks run in
+    /// the interpreter until translations are dropped.
+    pub limit: u32,
+    live: u32,
     /// Flash state the XIP translations match (`translation_generation`).
     generation: u32,
     /// SRAM code version the SRAM translations match.
@@ -202,6 +207,7 @@ impl Jit {
             if let Slot::Ready(function) = slot {
                 // SAFETY: host import; nothing calls the index any more.
                 unsafe { jit_release(*function as usize as i32) };
+                self.live -= 1;
             }
             false
         });
@@ -246,6 +252,8 @@ impl Jit {
             blocks: HashMap::default(),
             chain: vec![[u32::MAX, 0]; SLOTS],
             chaining: false,
+            limit: u32::MAX,
+            live: 0,
             generation: u32::MAX,
             sram_generation: u32::MAX,
             xip_chain_off: false,
@@ -277,6 +285,10 @@ impl Jit {
                 *count += 1;
                 return None;
             }
+            Slot::Counting(_) if self.live >= self.limit => {
+                *slot = Slot::Counting(0);
+                return None;
+            }
             Slot::Counting(_) => {}
         }
         let chain = self
@@ -295,6 +307,7 @@ impl Jit {
         let slot = match compiled {
             Some(function) => {
                 self.stats.compiled += 1;
+                self.live += 1;
                 self.chain[index] = [pc, function as usize as u32];
                 Slot::Ready(function)
             }

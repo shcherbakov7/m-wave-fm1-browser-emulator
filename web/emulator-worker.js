@@ -36,6 +36,7 @@ async function init(wasmUrl, mode = {}) {
   const response = await fetch(wasmUrl);
   x = await instantiateFm1(await response.arrayBuffer(), { chaining: mode.chaining !== false });
   if (mode.jit === false) x.fm1_set_jit(0);
+  if (mode.blockLimit) x.fm1_set_jit_limit(mode.blockLimit);
   audioPtr = x.fm1_alloc(AUDIO_CHUNK * 2 * 4);
   serialPtr = x.fm1_alloc(4096);
   postMessage({ type: "ready" });

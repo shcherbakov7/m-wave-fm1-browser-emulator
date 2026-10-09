@@ -93,6 +93,7 @@ impl Machine {
             self.jit.enabled = previous.jit.enabled;
             self.jit.verify = previous.jit.verify;
             self.jit.chaining = previous.jit.chaining;
+            self.jit.limit = previous.jit.limit;
         }
         self.master = previous.master;
         cpu.bus.devices.adc.master = self.master;
@@ -527,6 +528,15 @@ pub extern "C" fn fm1_profile_exec(start: u32) -> usize {
 }
 
 /// Turn per-block verification against the interpreter on (1) or off (0).
+/// Keep at most `limit` translated blocks alive (0 = no limit).
+#[no_mangle]
+pub extern "C" fn fm1_set_jit_limit(limit: u32) {
+    #[cfg(target_arch = "wasm32")]
+    with(|m| m.jit.limit = if limit == 0 { u32::MAX } else { limit });
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = limit;
+}
+
 /// Let translated blocks call each other directly (the host must support
 /// WebAssembly tail calls). Takes effect for blocks translated afterwards.
 #[no_mangle]
