@@ -113,7 +113,11 @@ else if (params.get("chain") === "0") level = Math.max(level, 1);
 else if (params.get("jit") === "1") level = 0;
 store.set("fm1-mode", level);
 if (!beat || Date.now() - beat.time >= 5 * 60_000 || modeNote) store.set("fm1-heartbeat", null);
-const mode = MODES[level];
+// WebKit (Safari, and every browser on iOS) has a small pool for compiled
+// code: keep the number of translated blocks alive within it.
+const webkit = /iPhone|iPad|iPod/.test(navigator.userAgent)
+  || (/AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg/.test(navigator.userAgent));
+const mode = { ...MODES[level], blockLimit: webkit ? 1000 : 0 };
 // While a firmware runs, leave a heartbeat; a clean exit removes it.
 setInterval(() => {
   if (current && $("state").classList.contains("running")) {
@@ -148,7 +152,7 @@ function showEngine(info = null) {
   const jit = info?.jit;
   const browser = navigator.userAgent.match(/(Version\/[\d.]+.*Safari|Chrome\/[\d.]+|Firefox\/[\d.]+|Edg\/[\d.]+)/)?.[0] ?? "";
   const platform = /iPhone|iPad/.test(navigator.userAgent) ? "iOS" : /Android/.test(navigator.userAgent) ? "Android" : "";
-  const details = jit ? ` · блоков ${jit.compiled}, цепочки ${jit.chaining ? "вкл" : "выкл"}` : "";
+  const details = jit ? ` · блоков ${jit.compiled}${mode.blockLimit ? ` (не больше ${mode.blockLimit})` : ""}, цепочки ${jit.chaining ? "вкл" : "выкл"}` : "";
   $("engine").innerHTML = `${modeNote ? `<span class="engine-warn">${escape(modeNote)}</span><br>` : ""}
     Режим: ${escape(mode.name)}${details} · ${escape([platform, browser].filter(Boolean).join(" "))}
     ${level ? ` · <a href="?jit=1">вернуть полный режим</a>` : ""}`;
