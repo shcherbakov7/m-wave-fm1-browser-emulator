@@ -199,7 +199,6 @@ impl Nor {
     }
     pub fn write(&mut self, a: u32, v: u32) -> Option<Result<(), &'static str>> {
         self.read(a)?;
-        self.generation = self.generation.wrapping_add(1);
         if (a == 0x40304 && v != 0) || ((a == 0x40310 || a == 0x40314) && v != 0) {
             return Some(Err(
                 "SFC dynamic key and encrypted-window changes are not implemented",
@@ -252,7 +251,13 @@ impl Nor {
             }
             self.regs[11] |= 0x8000;
         }
-        self.regs[Self::register_index(a).unwrap()] = value;
+        let index = Self::register_index(a).unwrap();
+        // Only SFC_CON, SFC_BASE, the encryption controls and flash pin
+        // routing change what XIP returns; SPI0 transfers do not.
+        if matches!(index, 0 | 3 | 4 | 6 | 7 | 10) && self.regs[index] != value {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.regs[index] = value;
         Some(Ok(()))
     }
 }

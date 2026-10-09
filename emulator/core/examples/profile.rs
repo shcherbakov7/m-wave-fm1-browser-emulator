@@ -44,6 +44,7 @@ fn main() -> Result<(), String> {
         cpu.steps as f64 / 1e6 / elapsed,
         guest / elapsed
     );
+    println!("code generation: {}", cpu.bus.code_generation());
     println!("batched: {:.1}%", cpu.batched_steps as f64 * 100.0 / cpu.steps.max(1) as f64);
     let mut sorted: Vec<_> = ops.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));

@@ -549,7 +549,7 @@ impl Bus {
     }
 
     /// Changes whenever cached XIP instruction words may be stale.
-    pub(crate) fn code_generation(&self) -> u32 {
+    pub fn code_generation(&self) -> u32 {
         self.nor.generation
     }
 
