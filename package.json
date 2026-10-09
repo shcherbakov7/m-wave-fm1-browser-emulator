@@ -1,0 +1,14 @@
+{
+  "name": "m-wave-fm1-browser-emulator",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "build": "tools/build-web.sh",
+    "serve": "python3 -m http.server -d web 8080",
+    "smoke": "node tools/browser-smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}

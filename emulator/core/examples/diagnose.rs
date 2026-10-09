@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Bounded boot diagnostics using the same CPU/bus as the graphical emulator.
+use fm1_emu::{cpu::Cpu, firmware::Firmware};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    env,
+    io::{self, Write},
+    path::Path,
+    process::ExitCode,
+};
+
+fn location(symbols: &BTreeMap<String, u32>, pc: u32) -> String {
+    let closest = symbols
+        .iter()
+        .filter(|(_, address)| **address <= pc)
+        .max_by_key(|(_, address)| **address);
+    match closest {
+        Some((name, address)) => format!("0x{pc:08x} ({name}+0x{:x})", pc - address),
+        None => format!("0x{pc:08x}"),
+    }
+}
+
+fn run() -> Result<(), String> {
+    let args: Vec<_> = env::args().skip(1).collect();
+    if !(1..=2).contains(&args.len()) {
+        return Err("usage: diagnose FIRMWARE.{fwsc,elf,bin} [INSTRUCTION_LIMIT]".into());
+    }
+    let limit: u64 = args
+        .get(1)
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|_| "invalid instruction limit")?
+        .unwrap_or(10_000_000);
+    let firmware = Firmware::load(Path::new(&args[0]))?;
+    let mut cpu = Cpu::new(firmware.bus()?, firmware.entry);
+    cpu.r[0] = 0x01c7_fe08;
+    let mut recent = VecDeque::new();
+    let mut serial_bytes = 0u64;
+    let mut stdout = io::stdout().lock();
+    let mut fault = None;
+    if env::var_os("DIAG_FAST").is_some() {
+        // Batched execution as used by the browser; no per-step history.
+        if let Err(error) = cpu.step_many(limit) {
+            fault = Some(error);
+        }
+        while let Some(byte) = cpu.bus.usb.serial.pop_front() {
+            stdout.write_all(&[byte]).map_err(|e| e.to_string())?;
+            serial_bytes += 1;
+        }
+    }
+    for _ in 0..if fault.is_some() || env::var_os("DIAG_FAST").is_some() { 0 } else { limit } {
+        let pc = cpu.pc;
+        match cpu.step() {
+            Ok(op) => {
+                if recent.len() == 12 {
+                    recent.pop_front();
+                }
+                recent.push_back((pc, op));
+            }
+            Err(error) => {
+                fault = Some(error);
+                break;
+            }
+        }
+        // Terminal stdout contains only real guest CDC endpoint data.
+        while let Some(byte) = cpu.bus.usb.serial.pop_front() {
+            stdout.write_all(&[byte]).map_err(|e| e.to_string())?;
+            serial_bytes += 1;
+        }
+    }
+    stdout.flush().map_err(|e| e.to_string())?;
+    eprintln!("application: {}", args[0]);
+    eprintln!("executed: {} instructions", cpu.steps);
+    eprintln!("stopped: {}", location(&firmware.symbols, cpu.pc));
+    eprintln!(
+        "LCD: {} pixels written; visible={}",
+        cpu.bus.lcd.pixels_written,
+        cpu.bus.screen_visible()
+    );
+    eprintln!(
+        "interrupts: {}; USB: {} host setups, {} packets, {} CDC bytes",
+        cpu.irq_entries, cpu.bus.usb.setups, cpu.bus.usb.packets, serial_bytes
+    );
+    eprintln!("watchdog: {} feeds", cpu.bus.system.watchdog_feeds);
+    eprintln!(
+        "audio: {} stereo frames, {} DMA halves; ADC: {} conversions",
+        cpu.bus.audio.frames, cpu.bus.audio.halves, cpu.bus.devices.adc.conversions
+    );
+    if let Some(&address) = firmware.symbols.get("felucca_dbg") {
+        // Existing guest diagnostics from Felucca's audio.c; no guest hooks.
+        if cpu.bus.read(address, 4).ok() == Some(0x44424731) {
+            let read = |offset| cpu.bus.read(address + offset, 4).unwrap_or(0);
+            eprintln!(
+                "Felucca: {} UI frames, {} rendered audio halves, {} timer IRQs; stage={}, page={}, home={}",
+                read(28), read(4), read(24), read(44), read(48), read(52)
+            );
+        }
+    }
+    if let Ok(path) = env::var("FM1_LCD_PPM") {
+        // Optional binary PPM of the guest LCD (black while the panel is off).
+        let mut image = b"P6\n240 240\n255\n".to_vec();
+        let visible = cpu.bus.screen_visible();
+        for &rgb in &cpu.bus.lcd.pixels {
+            let rgb = if visible { rgb } else { 0 };
+            image.extend_from_slice(&[(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]);
+        }
+        std::fs::write(&path, image).map_err(|e| format!("{path}: {e}"))?;
+    }
+    let words: Vec<String> = (0..4)
+        .map(|i| {
+            cpu.bus
+                .read(cpu.pc.wrapping_add(i * 2), 2)
+                .map_or("????".into(), |w| format!("{w:04x}"))
+        })
+        .collect();
+    eprintln!("words at pc: {}", words.join(" "));
+    eprintln!("recent completed instructions:");
+    for (pc, op) in recent {
+        eprintln!("  {}: {op}", location(&firmware.symbols, pc));
+    }
+    eprintln!("registers:");
+    for (i, register) in cpu.r.iter().enumerate() {
+        eprintln!("  r{i}=0x{register:08x}");
+    }
+    eprintln!(
+        "  sp=0x{:08x}; rets=0x{:08x}; interrupts_enabled={}",
+        cpu.sr[14], cpu.sr[3], cpu.interrupts_enabled
+    );
+    match fault {
+        Some(error) => Err(error.to_string()),
+        None => Err(format!("instruction limit {limit} reached")),
+    }
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("diagnose: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}

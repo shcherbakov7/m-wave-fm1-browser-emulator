@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: emulator
+      - name: Core tests
+        run: cargo test --release --manifest-path emulator/Cargo.toml
+      - name: Build WebAssembly
+        run: tools/build-web.sh
+      - name: Package site
+        run: |
+          mkdir -p _site
+          cp web/*.html web/*.css web/*.js web/fm1.wasm _site/
+          cp LICENSE _site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    # Publishes the emulator to GitHub Pages from the default branch.
+    # Enable it once under Settings → Pages → Source: GitHub Actions.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
