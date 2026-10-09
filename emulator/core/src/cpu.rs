@@ -180,7 +180,7 @@ pub struct Cpu {
     pub time_warp: bool,
     warp_allowed: bool,
     /// Last timer poll: (pc, steps, bus writes, irq entries).
-    last_poll: (u32, u64, u64, u64),
+    last_poll: (u32, u64, u32, u64),
     fast: fast::Cache,
     /// Steps executed by batches (diagnostics).
     pub batched_steps: u64,
@@ -422,7 +422,7 @@ impl Cpu {
     /// Execute the instruction at `pc` (or one idle wait), including the
     /// conditional-block skips and repeat-loop bookkeeping that follow it,
     /// without advancing time or dispatching interrupts. Returns its pc.
-    fn execute_current(&mut self) -> Result<(u32, &'static str), Fault> {
+    pub(crate) fn execute_current(&mut self) -> Result<(u32, &'static str), Fault> {
         if let Some((at, end)) = self.predicate_skip {
             if self.pc == at {
                 self.pc = end;

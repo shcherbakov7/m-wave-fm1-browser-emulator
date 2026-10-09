@@ -43,6 +43,7 @@ mod blocks;
 mod decode;
 mod extended;
 mod jit;
+pub mod wasmjit;
 
 pub mod system;
 

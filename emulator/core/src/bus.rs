@@ -109,8 +109,12 @@ pub struct Bus {
     /// Reads of a free-running timer count (TIMER4/TIMER5 CNT), for
     /// recognizing polling loops.
     pub(crate) timer_polls: std::cell::Cell<u64>,
-    /// Guest writes of any kind, for recognizing side-effect-free loops.
-    pub(crate) writes: u64,
+    /// Guest writes of any kind (wrapping), for recognizing side-effect-free
+    /// loops. Translated code increments it in place.
+    pub(crate) writes: u32,
+    /// Nonzero while a CPU write-protection window is enabled; translated
+    /// code reads it in place.
+    pub(crate) guard_flag: u32,
     /// Accesses that reached device registers (not SRAM or XIP); batches
     /// end after one so devices are brought up to date.
     pub(crate) device_accesses: std::cell::Cell<u64>,
@@ -166,6 +170,7 @@ impl Bus {
             oscillator_ticks: 0,
             timer_polls: Default::default(),
             writes: 0,
+            guard_flag: 0,
             device_accesses: Default::default(),
             code_cache: vec![
                 CodeEntry {
@@ -380,7 +385,7 @@ impl Bus {
 
     pub fn write(&mut self, address: u32, value: u32, size: usize) -> Result<(), AccessFault> {
         Self::check(address, size, "write")?;
-        self.writes += 1;
+        self.writes = self.writes.wrapping_add(1);
         if let Some(offset) = Self::offset(address, size, RAM, self.ram.len()) {
             self.guards
                 .check_write(address, size)
@@ -454,6 +459,7 @@ impl Bus {
             return Ok(());
         }
         if let Some(result) = self.guards.write(address, value) {
+            self.guard_flag = self.guards.active() as u32;
             return result.map_err(|reason| Self::fault(address, size, "write", reason));
         }
         if let Some(result) = self.system.write(address, value) {
@@ -546,6 +552,14 @@ impl Bus {
     pub(crate) fn instruction_ticks_n(&mut self, count: u64) -> u64 {
         self.clock
             .instruction_ticks_n(self.audio.read(0x10014).unwrap(), count)
+    }
+
+    pub(crate) fn ram(&self) -> &[u8] {
+        &self.ram
+    }
+
+    pub(crate) fn ram_mut(&mut self) -> &mut [u8] {
+        &mut self.ram
     }
 
     /// Changes whenever cached XIP instruction words may be stale.

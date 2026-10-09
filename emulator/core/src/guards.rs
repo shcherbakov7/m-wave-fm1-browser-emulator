@@ -70,6 +70,9 @@ impl Guards {
             .collect();
         Some(Ok(()))
     }
+    pub(crate) fn active(&self) -> bool {
+        !self.windows.is_empty()
+    }
     pub fn check_write(&self, a: u32, size: usize) -> Result<(), &'static str> {
         for &(low, high) in &self.windows {
             if a <= high && a as u64 + size as u64 > low as u64 {
