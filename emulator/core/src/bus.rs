@@ -104,6 +104,13 @@ pub struct Bus {
     clock: crate::clock::Clock,
     wireless: crate::wireless::Wireless,
     shift_spi: crate::shift_spi::ShiftSpi,
+    /// Guest time: 24 MHz oscillator ticks advanced since reset.
+    pub oscillator_ticks: u64,
+    /// Reads of a free-running timer count (TIMER4/TIMER5 CNT), for
+    /// recognizing polling loops.
+    pub(crate) timer_polls: std::cell::Cell<u64>,
+    /// Guest writes of any kind, for recognizing side-effect-free loops.
+    pub(crate) writes: u64,
 }
 
 impl Bus {
@@ -142,6 +149,9 @@ impl Bus {
             clock: Default::default(),
             wireless: Default::default(),
             shift_spi: Default::default(),
+            oscillator_ticks: 0,
+            timer_polls: Default::default(),
+            writes: 0,
         })
     }
 
@@ -186,6 +196,9 @@ impl Bus {
         operation: &'static str,
     ) -> Result<u32, AccessFault> {
         Self::check(address, size, operation)?;
+        if let Some(offset) = Self::offset(address, size, RAM, self.ram.len()) {
+            return Ok(Self::little_endian(&self.ram[offset..offset + size]));
+        }
         let bytes = if let Some(offset) = Self::offset(address, size, XIP, self.flash.len()) {
             if !self.nor.xip_active() {
                 return Err(Self::fault(
@@ -260,6 +273,9 @@ impl Bus {
                     ))
                 };
             }
+            if address == crate::devices::TIMER4 + 4 || address == crate::devices::TIMER5 + 4 {
+                self.timer_polls.set(self.timer_polls.get() + 1);
+            }
             if let Some(value) = self.devices.read(address, size) {
                 return value
                     .map(|value| {
@@ -279,10 +295,17 @@ impl Bus {
                 "unmapped memory or unimplemented MMIO",
             ));
         };
-        Ok(bytes
-            .iter()
-            .enumerate()
-            .fold(0, |value, (i, byte)| value | ((*byte as u32) << (i * 8))))
+        Ok(Self::little_endian(bytes))
+    }
+
+    #[inline]
+    fn little_endian(bytes: &[u8]) -> u32 {
+        match *bytes {
+            [a] => a as u32,
+            [a, b] => u16::from_le_bytes([a, b]) as u32,
+            [a, b, c, d] => u32::from_le_bytes([a, b, c, d]),
+            _ => unreachable!("access widths are checked"),
+        }
     }
 
     pub fn read(&self, address: u32, size: usize) -> Result<u32, AccessFault> {
@@ -290,12 +313,20 @@ impl Bus {
     }
 
     pub fn fetch(&self, address: u32) -> Result<u16, AccessFault> {
+        // Fast path for the common case, packaged XIP: same checks as read_as
+        // (XIP window, SFC state, encryption) without the device chain.
+        if address & 1 == 0 && self.nor.packaged() && Self::offset(address, 2, XIP, self.flash.len()).is_some() {
+            if let Some(Ok(value)) = self.nor.xip(address, 2) {
+                return Ok(value as u16);
+            }
+        }
         // Startup later copies .ram_text here; instructions can execute from RAM.
         self.read_as(address, 2, "fetch").map(|value| value as u16)
     }
 
     pub fn write(&mut self, address: u32, value: u32, size: usize) -> Result<(), AccessFault> {
         Self::check(address, size, "write")?;
+        self.writes += 1;
         if let Some(offset) = Self::offset(address, size, RAM, self.ram.len()) {
             self.guards
                 .check_write(address, size)

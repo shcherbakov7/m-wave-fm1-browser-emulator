@@ -161,3 +161,31 @@ fn unsigned_immediate_branches_zero_extend_and_equality_sign_extends() {
     assert!(branch(0xf846, 0x820f, 6, (-447i32) as u32));
     assert!(!branch(0xf846, 0x820f, 6, 577));
 }
+
+#[test]
+fn time_warp_shortens_idle_waits_without_skipping_the_interrupt() {
+    use fm1_emu::devices::IRQ_CONFIG;
+    // The idle/TIMER3 program from the FM-1_996 idle test: with warping the
+    // same interrupt still arrives and resumes after IDLE, only sooner.
+    let run = |warp: bool| {
+        let mut c = cpu(&[0x0001, 0x0020, 0x0020, 0x0020, 0x0020, 0x2341, 0, 0, 0x0081]);
+        c.time_warp = warp;
+        c.sr[14] = RAM + 256;
+        c.sr[13] = RAM + 512;
+        c.sr[11] = 0x100;
+        c.bus.write(0x01c7fe00 + 7 * 4, XIP + 16, 4).unwrap();
+        c.bus.write(IRQ_CONFIG, 5 << 28, 4).unwrap();
+        c.bus.write(0x10708, 32, 4).unwrap();
+        c.bus.write(0x10700, 0x4019, 4).unwrap();
+        c.interrupts_enabled = true;
+        let mut steps = 0;
+        while c.irq_entries == 0 {
+            c.step().unwrap();
+            steps += 1;
+            assert!(steps < 100_000);
+        }
+        assert_eq!(c.pc, XIP + 16);
+        steps
+    };
+    assert!(run(true) < run(false));
+}

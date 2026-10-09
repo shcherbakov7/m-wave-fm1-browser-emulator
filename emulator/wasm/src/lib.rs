@@ -9,9 +9,10 @@ use fm1_emu::{
 };
 use std::cell::RefCell;
 
-/// Guest steps a key stays closed after a press, so that even a short click
-/// lasts long enough (about 100 ms of guest time) for firmware scan/debounce.
-const MIN_PRESS_STEPS: u64 = 72_000_000;
+/// Guest time (24 MHz oscillator ticks, here 100 ms) a key stays closed after
+/// a press, so that even a short click lasts long enough for firmware
+/// scanning and debounce however slowly the emulator runs.
+const MIN_PRESS_TICKS: u64 = 2_400_000;
 const LCD_PIXELS: usize = 240 * 240;
 
 struct Machine {
@@ -59,7 +60,7 @@ impl Machine {
     fn sync_keys(&mut self) {
         let Some(cpu) = &mut self.cpu else { return };
         for id in 0..PANEL_CONTROLS {
-            let closed = self.held[id] || cpu.steps < self.release_after[id];
+            let closed = self.held[id] || cpu.bus.oscillator_ticks < self.release_after[id];
             if closed != self.closed[id] {
                 if let Some((column, row)) = panel_contact(id) {
                     let _ = cpu.bus.devices.gpio.press(column, row, closed);
@@ -180,8 +181,8 @@ pub extern "C" fn fm1_key(id: u32, down: u32) {
         }
         m.held[id] = down != 0;
         if down != 0 {
-            let steps = m.cpu.as_ref().map_or(0, |cpu| cpu.steps);
-            m.release_after[id] = steps + MIN_PRESS_STEPS;
+            let now = m.cpu.as_ref().map_or(0, |cpu| cpu.bus.oscillator_ticks);
+            m.release_after[id] = now + MIN_PRESS_TICKS;
         }
         m.sync_keys();
     })
@@ -258,9 +259,10 @@ pub extern "C" fn fm1_status() -> usize {
         let text = match &m.cpu {
             None => "{\"loaded\":false}".to_string(),
             Some(cpu) => format!(
-                "{{\"loaded\":true,\"steps\":{},\"irqs\":{},\"lcdPixels\":{},\"visible\":{},\
-                 \"audioFrames\":{},\"watchdogFeeds\":{},\"fault\":{}}}",
+                "{{\"loaded\":true,\"steps\":{},\"guestSeconds\":{},\"irqs\":{},\"lcdPixels\":{},\
+                 \"visible\":{},\"audioFrames\":{},\"watchdogFeeds\":{},\"fault\":{}}}",
                 cpu.steps,
+                cpu.bus.oscillator_ticks as f64 / 24e6,
                 cpu.irq_entries,
                 cpu.bus.lcd.pixels_written,
                 cpu.bus.screen_visible(),

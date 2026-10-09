@@ -173,7 +173,19 @@ pub struct Cpu {
     idle: bool,
     idle_wake_delay: u8,
     secondary: Option<Core>,
+    /// Fast-forward guest time while waiting (see `WARP_TICKS`). Hosts that
+    /// need instruction-exact timing can turn it off.
+    pub time_warp: bool,
+    warp_allowed: bool,
+    /// Last timer poll: (pc, steps, bus writes, irq entries).
+    last_poll: (u32, u64, u64, u64),
 }
+
+/// Oscillator ticks (1 µs) added per step while the only running core spins
+/// on a free-running timer without writing memory, or waits idle for an
+/// interrupt. The guest sees a faster CPU during the wait; interrupts and
+/// device events still arrive in order, at most 1 µs late.
+const WARP_TICKS: u32 = 24;
 
 // Per-core context. Memory and devices remain on the one shared bus.
 struct Core {
@@ -277,6 +289,9 @@ impl Cpu {
             idle: false,
             idle_wake_delay: 0,
             secondary: None,
+            time_warp: true,
+            warp_allowed: false,
+            last_poll: (u32::MAX, 0, 0, 0),
         }
     }
 
@@ -323,8 +338,12 @@ impl Cpu {
             && (self.bus.core_control(0) & 16 != 0
                 || self.secondary.as_ref().is_some_and(|core| core.bus_locked))
         {
+            self.warp_allowed = false;
             return self.step_secondary(true);
         }
+        // Only warp when no other core is doing work that needs the time.
+        self.warp_allowed = self.time_warp
+            && !(secondary_running && self.secondary.as_ref().is_some_and(|core| !core.idle));
         let op = self.step_core(true)?;
         if !self.bus_locked && secondary_running {
             self.step_secondary(false)?;
@@ -349,6 +368,7 @@ impl Cpu {
             }
         }
         let pc = self.pc;
+        let polls_before = self.bus.timer_polls.get();
         let op = if self.idle {
             // Keep shared hardware time and the other core running while this
             // core waits. IRQ entry resumes at the instruction after IDLE.
@@ -443,12 +463,28 @@ impl Cpu {
             }
         }
         self.steps += 1;
-        let ticks = if advance_time {
+        let mut ticks = if advance_time {
             self.bus.instruction_ticks()
         } else {
             0
         };
+        if advance_time && self.warp_allowed {
+            if self.idle {
+                ticks += WARP_TICKS;
+            } else if self.bus.timer_polls.get() != polls_before {
+                let (last_pc, last_steps, last_writes, last_irqs) = self.last_poll;
+                let spinning = last_pc == pc
+                    && self.steps - last_steps <= 64
+                    && self.bus.writes == last_writes
+                    && self.irq_entries == last_irqs;
+                self.last_poll = (pc, self.steps, self.bus.writes, self.irq_entries);
+                if spinning {
+                    ticks += WARP_TICKS;
+                }
+            }
+        }
         if ticks != 0 {
+            self.bus.oscillator_ticks += ticks as u64;
             self.bus.advance_devices(ticks);
             self.bus.advance_nor(ticks);
             self.bus.advance_wireless(ticks);

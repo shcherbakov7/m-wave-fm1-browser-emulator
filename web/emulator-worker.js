@@ -14,7 +14,7 @@ let paused = false;
 let stepsPerSlice = 200_000;  // adapted to SLICE_MS
 let lastFrame = 0;
 let lastStatus = 0;
-let rate = { steps: 0, time: 0, value: 0 };
+let rate = { guest: 0, time: 0, value: 0 };
 let audioPtr = 0;
 let serialPtr = 0;
 
@@ -36,7 +36,7 @@ async function init(wasmUrl) {
 function status() {
   x.fm1_status();
   const info = JSON.parse(message());
-  info.stepsPerSecond = rate.value;
+  info.realtime = rate.value;
   info.paused = paused;
   postMessage({ type: "status", info });
 }
@@ -49,7 +49,7 @@ function load(bytes, name) {
     postMessage({ type: "error", message: message(), name });
     return;
   }
-  rate = { steps: 0, time: performance.now(), value: 0 };
+  rate = { guest: 0, time: performance.now(), value: 0 };
   postMessage({ type: "loaded", name });
   running = true;
   paused = false;
@@ -90,9 +90,10 @@ function slice() {
   stepsPerSlice = Math.max(10_000, Math.min(20_000_000, Math.round(stepsPerSlice * SLICE_MS / elapsed)));
   if (now - rate.time >= 1000) {
     x.fm1_status();
-    const steps = JSON.parse(message()).steps;
-    rate.value = (steps - rate.steps) * 1000 / (now - rate.time);
-    rate = { steps, time: now, value: rate.value };
+    const guest = JSON.parse(message()).guestSeconds;
+    // Guest seconds per host second: 1.0 is real time.
+    const value = (guest - rate.guest) * 1000 / (now - rate.time);
+    rate = { guest, time: now, value };
   }
   flushOutputs(now);
   if (result === 1) {

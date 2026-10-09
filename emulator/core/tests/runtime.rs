@@ -270,6 +270,8 @@ fn idle_waits_for_a_timer_interrupt_and_resumes_after_the_opcode() {
     use fm1_emu::devices::IRQ_CONFIG;
     // FM-1_996: TIMER3 wakes IDLE, four CSYNCs complete, then IRQ entry.
     let mut c = cpu(&[0x0001, 0x0020, 0x0020, 0x0020, 0x0020, 0x2341, 0, 0, 0x0081]);
+    // Hardware-captured instruction timing: no host time warp.
+    c.time_warp = false;
     c.r[1] = 42;
     c.sr[14] = RAM + 256;
     c.sr[13] = RAM + 512;

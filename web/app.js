@@ -163,13 +163,12 @@ function setState(text, kind = "") {
   state.className = `state ${kind}`;
 }
 
-const GUEST_STEPS_PER_SECOND = 1.08e9; // both cores at the stock clock, measured
 function showStatus(info) {
   if (!info.loaded) return;
-  const pct = info.stepsPerSecond / GUEST_STEPS_PER_SECOND * 100;
-  $("speed").textContent = info.stepsPerSecond ? `${(info.stepsPerSecond / 1e6).toFixed(1)} M/с · ~${pct < 1 ? pct.toFixed(1) : pct.toFixed(0)}%` : "—";
+  const pct = info.realtime * 100;
+  $("speed").textContent = info.realtime ? `${pct < 10 ? pct.toFixed(1) : pct.toFixed(0)}% реального` : "—";
   $("steps").textContent = `${(info.steps / 1e6).toFixed(0)} M`;
-  $("guest-time").textContent = `${(info.audioFrames / 44100).toFixed(1)} с`;
+  $("guest-time").textContent = `${info.guestSeconds.toFixed(1)} с`;
   $("irqs").textContent = info.irqs.toLocaleString("ru");
   if (info.paused && !info.fault) setState(`Пауза: ${current?.name ?? ""}`, "paused");
   else if (!info.fault && current) setState(`Работает: ${current.name}`, "running");

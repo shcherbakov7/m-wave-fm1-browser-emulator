@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 pub struct Guards {
     registers: BTreeMap<u32, u32>,
+    /// Enabled write-protection windows `(low, high)` from DBG_EN/WR_LIMIT,
+    /// refreshed on every guard write so `check_write` needs no map lookups.
+    windows: Vec<(u32, u32)>,
 }
 impl Guards {
     fn known(a: u32) -> bool {
@@ -61,14 +64,15 @@ impl Guards {
                 self.registers.insert(a, v);
             }
         }
+        self.windows = (0..3)
+            .filter(|n| self.value(0x1eee348) & (1 << n) != 0)
+            .map(|n| (self.value(0x1eee2c0 + n * 4), self.value(0x1eee280 + n * 4)))
+            .collect();
         Some(Ok(()))
     }
     pub fn check_write(&self, a: u32, size: usize) -> Result<(), &'static str> {
-        for n in 0..3 {
-            if self.value(0x1eee348) & (1 << n) != 0
-                && a <= self.value(0x1eee280 + n * 4)
-                && a as u64 + size as u64 > self.value(0x1eee2c0 + n * 4) as u64
-            {
+        for &(low, high) in &self.windows {
+            if a <= high && a as u64 + size as u64 > low as u64 {
                 return Err("CPU write protection violation");
             }
         }

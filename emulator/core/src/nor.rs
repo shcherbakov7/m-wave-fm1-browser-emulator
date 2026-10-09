@@ -36,6 +36,18 @@ impl Default for Nor {
     }
 }
 
+fn little_endian(bytes: &[u8]) -> u32 {
+    match *bytes {
+        [a] => a as u32,
+        [a, b] => u16::from_le_bytes([a, b]) as u32,
+        [a, b, c, d] => u32::from_le_bytes([a, b, c, d]),
+        _ => bytes
+            .iter()
+            .enumerate()
+            .fold(0, |value, (i, byte)| value | ((*byte as u32) << (i * 8))),
+    }
+}
+
 impl Nor {
     pub fn load(&mut self, bytes: &[u8], key: u16) {
         self.bytes[..bytes.len()].copy_from_slice(bytes);
@@ -49,12 +61,13 @@ impl Nor {
         self.decoded.is_some()
     }
     pub fn xip_active(&self) -> bool {
-        self.read(0x40200).unwrap() & 1 != 0 && self.read(0x5101c).unwrap() & 32 != 0
+        // SFC_CON (0x40200) bit 0 and flash pin routing (0x5101c) bit 5.
+        self.regs[0] & 1 != 0 && self.regs[10] & 32 != 0
     }
 
     pub fn xip(&self, address: u32, size: usize) -> Option<Result<u32, &'static str>> {
-        // The SFC maps flash offset 0x4000 at CPU address 0x02000000.
-        let offset = address.checked_sub(0x0200_0000)? as usize + self.read(0x4020c)? as usize;
+        // The SFC maps flash offset 0x4000 (SFC_BASE, 0x4020c) at 0x02000000.
+        let offset = address.checked_sub(0x0200_0000)? as usize + self.regs[3] as usize;
         let bytes = self.bytes.get(offset..offset.checked_add(size)?)?;
         if self.busy_ticks != 0 {
             return Some(Err("XIP unavailable while SPI NOR is busy"));
@@ -64,32 +77,27 @@ impl Nor {
                 "XIP unavailable while SFC or flash pin routing is disabled",
             ));
         }
-        let control = self.read(0x40300).unwrap();
+        // ENC_CON (0x40300) and its plain window ENC_END/ENC_START.
+        let control = self.regs[4];
         let plain = control & 1 == 0
             || (control & 2 != 0
-                && address >= self.read(0x4030c).unwrap()
-                && address.checked_add(size as u32 - 1)? <= self.read(0x40308).unwrap());
-        if !plain {
-            if let Some(decoded) = &self.decoded {
-                if offset < 0x4000 {
-                    return Some(Err(
-                        "encrypted XIP below application area is not implemented",
-                    ));
-                }
-                let bytes = &decoded[offset - 0x4000..offset - 0x4000 + size];
-                return Some(Ok(bytes
-                    .iter()
-                    .enumerate()
-                    .fold(0, |value, (i, byte)| value | ((*byte as u32) << (i * 8)))));
-            } else {
+                && address >= self.regs[7]
+                && address.checked_add(size as u32 - 1)? <= self.regs[6]);
+        let bytes = if plain {
+            bytes
+        } else if let Some(decoded) = &self.decoded {
+            if offset < 0x4000 {
                 return Some(Err(
-                    "encrypted XIP outside the supplied application is not available",
+                    "encrypted XIP below application area is not implemented",
                 ));
             }
-        }
-        Some(Ok(bytes.iter().enumerate().fold(0, |value, (i, byte)| {
-            value | ((*byte as u32) << (i * 8))
-        })))
+            &decoded[offset - 0x4000..offset - 0x4000 + size]
+        } else {
+            return Some(Err(
+                "encrypted XIP outside the supplied application is not available",
+            ));
+        };
+        Some(Ok(little_endian(bytes)))
     }
 
     pub fn read(&self, a: u32) -> Option<u32> {

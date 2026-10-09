@@ -10,12 +10,15 @@ fn main() -> Result<(), String> {
     let firmware = Firmware::load(Path::new(path))?;
     let mut cpu = Cpu::new(firmware.bus()?, firmware.entry);
     cpu.r[0] = 0x01c7_fe08;
+    // Counting ops costs a hash per step; enable it with PROFILE_OPS=1.
+    let count_ops = env::var_os("PROFILE_OPS").is_some();
     let mut ops: HashMap<&'static str, u64> = HashMap::new();
     let start = Instant::now();
     let mut fault = None;
     for _ in 0..limit {
         match cpu.step() {
-            Ok(op) => *ops.entry(op).or_default() += 1,
+            Ok(op) if count_ops => *ops.entry(op).or_default() += 1,
+            Ok(_) => {}
             Err(error) => {
                 fault = Some(error.to_string());
                 break;
