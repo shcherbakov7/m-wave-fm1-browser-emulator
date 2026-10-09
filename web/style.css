@@ -223,3 +223,5 @@ select.primary option, select.primary optgroup { background: var(--panel); color
   .actions label.button { display: none; }   /* own files: in the firmware card */
   .actions .button, .actions select { padding: 8px 6px; text-align: center; }
 }
+.engine { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.engine-warn { color: #ffd5d1; }

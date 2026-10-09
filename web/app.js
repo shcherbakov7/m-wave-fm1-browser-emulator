@@ -56,7 +56,7 @@ let audio = null;   // { context, node }
 
 worker.onmessage = ({ data }) => {
   switch (data.type) {
-    case "ready": restoreLast(); break;
+    case "ready": showEngine(); restoreLast(); break;
     case "loaded":
       setState(`Работает: ${data.name}`, "running");
       $("drop-hint").classList.add("hidden");
@@ -75,7 +75,54 @@ worker.onmessage = ({ data }) => {
     case "error": setState(`Ошибка${data.name ? ` (${data.name})` : ""}: ${data.message}`, "fault"); break;
   }
 };
-worker.postMessage({ type: "init", wasmUrl: new URL(`fm1.wasm${VERSION}`, location.href).href });
+// --- Engine mode and crash guard ---------------------------------------------
+// The fast path compiles guest code to many small WebAssembly modules that
+// call each other with tail calls. If a browser tab dies while the emulator
+// runs (a heartbeat is left behind without a clean exit), the next visit
+// steps down: no tail calls, then no translation at all. ?jit=0 and
+// ?chain=0 force a mode; ?jit=1 resets it.
+const MODES = [
+  { name: "полный (JIT с цепочками)", jit: true, chaining: true },
+  { name: "JIT без цепочек", jit: true, chaining: false },
+  { name: "только интерпретатор (медленно)", jit: false, chaining: false },
+];
+const store = {
+  get(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private mode */ } },
+};
+const params = new URL(location.href).searchParams;
+let level = store.get("fm1-mode") ?? 0;
+let modeNote = "";
+// Other open tabs answer, so their heartbeat is not mistaken for a crash.
+const tabs = new BroadcastChannel("fm1-tabs");
+tabs.onmessage = ({ data }) => { if (data === "ping" && current) tabs.postMessage("pong"); };
+const otherTabRunning = () => new Promise((resolve) => {
+  const listener = ({ data }) => { if (data === "pong") resolve(true); };
+  tabs.addEventListener("message", listener);
+  tabs.postMessage("ping");
+  setTimeout(() => { tabs.removeEventListener("message", listener); resolve(false); }, 400);
+});
+const beat = store.get("fm1-heartbeat");
+if (beat && Date.now() - beat.time < 5 * 60_000 && beat.level >= level && level < MODES.length - 1
+    && !(await otherTabRunning())) {
+  level = beat.level + 1;
+  modeNote = `Прошлый запуск (${beat.firmware ?? "прошивка"}) завершился аварийно — включён режим «${MODES[level].name}».`;
+}
+if (params.get("jit") === "0") level = 2;
+else if (params.get("chain") === "0") level = Math.max(level, 1);
+else if (params.get("jit") === "1") level = 0;
+store.set("fm1-mode", level);
+if (!beat || Date.now() - beat.time >= 5 * 60_000 || modeNote) store.set("fm1-heartbeat", null);
+const mode = MODES[level];
+// While a firmware runs, leave a heartbeat; a clean exit removes it.
+setInterval(() => {
+  if (current && $("state").classList.contains("running")) {
+    store.set("fm1-heartbeat", { time: Date.now(), level, firmware: current.name });
+  }
+}, 2000);
+addEventListener("pagehide", () => store.set("fm1-heartbeat", null));
+
+worker.postMessage({ type: "init", wasmUrl: new URL(`fm1.wasm${VERSION}`, location.href).href, mode });
 
 function setState(text, kind = "") {
   const state = $("state");
@@ -91,8 +138,20 @@ function showStatus(info) {
   $("steps").textContent = `${(info.steps / 1e6).toFixed(0)} M`;
   $("guest-time").textContent = `${info.guestSeconds.toFixed(1)} с`;
   $("irqs").textContent = info.irqs.toLocaleString("ru");
+  showEngine(info);
   if (info.paused && !info.fault) setState(`Пауза: ${current?.name ?? ""}`, "paused");
   else if (!info.fault && current) setState(`Работает: ${current.name}`, "running");
+}
+
+/** Engine mode and browser, for reports (and the crash-guard notice). */
+function showEngine(info = null) {
+  const jit = info?.jit;
+  const browser = navigator.userAgent.match(/(Version\/[\d.]+.*Safari|Chrome\/[\d.]+|Firefox\/[\d.]+|Edg\/[\d.]+)/)?.[0] ?? "";
+  const platform = /iPhone|iPad/.test(navigator.userAgent) ? "iOS" : /Android/.test(navigator.userAgent) ? "Android" : "";
+  const details = jit ? ` · блоков ${jit.compiled}, цепочки ${jit.chaining ? "вкл" : "выкл"}` : "";
+  $("engine").innerHTML = `${modeNote ? `<span class="engine-warn">${escape(modeNote)}</span><br>` : ""}
+    Режим: ${escape(mode.name)}${details} · ${escape([platform, browser].filter(Boolean).join(" "))}
+    ${level ? ` · <a href="?jit=1">вернуть полный режим</a>` : ""}`;
 }
 
 function appendSerial(text) {
