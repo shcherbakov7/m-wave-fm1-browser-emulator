@@ -25,7 +25,7 @@ const errors = [];
 page.on("pageerror", (error) => errors.push(String(error)));
 page.on("console", (message) => message.type() === "error" && errors.push(message.text()));
 await page.goto(url);
-await page.waitForFunction(() => document.getElementById("state").textContent.startsWith("Загрузите"));
+await page.waitForFunction(() => document.getElementById("state").textContent.startsWith("Выберите"));
 await page.setInputFiles("#file", firmware);
 
 // Wait until the guest has drawn to its screen (or faulted).

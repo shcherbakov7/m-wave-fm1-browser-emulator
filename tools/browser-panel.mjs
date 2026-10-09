@@ -26,7 +26,7 @@ const errors = [];
 page.on("pageerror", (error) => errors.push(String(error)));
 page.on("console", (message) => message.type() === "error" && errors.push(message.text()));
 await page.goto(`http://127.0.0.1:${server.address().port}/`);
-await page.waitForFunction(() => document.getElementById("state").textContent.startsWith("Загрузите"));
+await page.waitForFunction(() => document.getElementById("state").textContent.startsWith("Выберите"));
 await page.setInputFiles("#file", firmware);
 
 const lcd = () => page.evaluate(() => Array.from(document.getElementById("lcd").getContext("2d").getImageData(0, 0, 240, 240).data));

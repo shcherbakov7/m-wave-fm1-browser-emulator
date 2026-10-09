@@ -98,20 +98,73 @@ function appendSerial(text) {
   pre.scrollTop = pre.scrollHeight;
 }
 
-// --- Firmware loading & recent list (IndexedDB) ----------------------------
-function boot(name, bytes) {
-  current = { name, bytes };
+// --- Firmware: ready-made catalog, own files, recent list (IndexedDB) -------
+let catalog = [];   // web/firmware/catalog.json (tools/update-firmware.mjs)
+
+/** Start `bytes`; `entry` is the catalog entry it came from, if any. */
+function boot(name, bytes, entry = null) {
+  current = { name, bytes, entry };
   releaseAll();
   $("serial").textContent = "";
   setState(`Загрузка ${name}…`);
+  showAbout(entry);
   worker.postMessage({ type: "load", name, bytes: bytes.slice(0) });
-  remember(name, bytes).then(refreshRecent);
+  if (!entry) remember(name, bytes).then(refreshRecent);
+  const url = new URL(location.href);
+  if (entry) url.searchParams.set("fw", entry.id); else url.searchParams.delete("fw");
+  history.replaceState(null, "", url);
 }
 
 async function openFile(file) {
   if (!file) return;
   if (file.size > 16 * 1024 * 1024) { setState("Файл слишком большой для прошивки FM-1", "fault"); return; }
   boot(file.name, await file.arrayBuffer());
+}
+
+const escape = (text) => String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+function showAbout(entry, error = "") {
+  const about = $("about");
+  about.hidden = !entry;
+  if (!entry) return;
+  const link = entry.source ?? entry.page;
+  about.innerHTML = `${error ? `<p class="about-error">${error}</p>` : ""}
+    <strong>${escape(entry.name)} ${escape(entry.version)}</strong> — ${escape(entry.author)}<br>
+    ${escape(entry.description)}<br>
+    <small>${escape(entry.license)}${entry.date ? ` · ${escape(entry.date)}` : ""} ·
+    <a href="${escape(link)}" target="_blank" rel="noopener">${entry.source ? "исходники и инструкции" : "страница загрузки"}</a></small>`;
+}
+
+/** Download a catalog firmware and start it. */
+async function bootCatalog(entry) {
+  const name = `${entry.name} ${entry.version}`;
+  setState(`Скачивание ${name}…`);
+  showAbout(entry);
+  try {
+    const response = await fetch(entry.file ?? entry.url, { cache: "force-cache" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    boot(name, await response.arrayBuffer(), entry);
+  } catch (error) {
+    if (current) {
+      showAbout(entry, `Не удалось скачать ${escape(name)}, работает прежняя прошивка. ` + (entry.url
+        ? `Сервер M-VAVE не отдаёт файл другим сайтам: скачайте <a href="${escape(entry.url)}">FM-1.fwsc</a> и откройте его кнопкой «Свой файл».`
+        : escape(String(error))));
+      return;
+    }
+    setState(`Не удалось скачать ${name}`, "fault");
+    showAbout(entry, entry.url
+      ? `Сервер M-VAVE не отдаёт файл другим сайтам. Скачайте <a href="${escape(entry.url)}">FM-1.fwsc</a> с официального сервера и откройте его кнопкой «Свой файл» — дальше он будет в списке «Недавние».`
+      : escape(String(error)));
+  }
+}
+
+async function loadCatalog() {
+  try {
+    const response = await fetch("firmware/catalog.json", { cache: "no-cache" });
+    catalog = response.ok ? await response.json() : [];
+  } catch {
+    catalog = [];
+  }
 }
 
 $("file").addEventListener("change", (event) => openFile(event.target.files[0]));
@@ -131,11 +184,16 @@ $("pause").addEventListener("click", () => {
   worker.postMessage({ type: "pause", paused });
 });
 $("restart").addEventListener("click", () => current && boot(current.name, current.bytes));
-$("recent").addEventListener("change", async (event) => {
-  const name = event.target.value;
+$("firmware").addEventListener("change", async (event) => {
+  const [kind, key] = [event.target.value.slice(0, 2), event.target.value.slice(2)];
   event.target.value = "";
-  const entry = name && (await database("readonly", (store) => store.get(name)));
-  if (entry) boot(entry.name, entry.bytes);
+  if (kind === "c:") {
+    const entry = catalog.find((e) => e.id === key);
+    if (entry) bootCatalog(entry);
+  } else if (kind === "r:") {
+    const saved = await database("readonly", (store) => store.get(key));
+    if (saved) boot(saved.name, saved.bytes);
+  }
 });
 
 $("serial-form").addEventListener("submit", (event) => {
@@ -184,14 +242,29 @@ function database(mode, action) {
 const remember = (name, bytes) => database("readwrite", (store) => store.put({ name, bytes, time: Date.now() }));
 
 async function refreshRecent() {
-  const entries = (await database("readonly", (store) => store.getAll())) ?? [];
-  entries.sort((a, b) => b.time - a.time);
-  const select = $("recent");
-  select.replaceChildren(new Option("Недавние…", ""), ...entries.map((e) => new Option(e.name, e.name)));
+  const saved = (await database("readonly", (store) => store.getAll())) ?? [];
+  saved.sort((a, b) => b.time - a.time);
+  const group = (label, options) => {
+    const element = document.createElement("optgroup");
+    element.label = label;
+    element.append(...options);
+    return element;
+  };
+  const official = catalog.filter((e) => e.url), open = catalog.filter((e) => e.file);
+  const groups = [new Option("Выбрать прошивку…", "")];
+  if (official.length) groups.push(group("Официальная", official.map((e) => new Option(`${e.name} ${e.version}`, `c:${e.id}`))));
+  if (open.length) groups.push(group("Открытые прошивки", open.map((e) => new Option(`${e.name} ${e.version} — ${e.author}`, `c:${e.id}`))));
+  if (saved.length) groups.push(group("Ваши файлы (недавние)", saved.map((e) => new Option(e.name, `r:${e.name}`))));
+  $("firmware").replaceChildren(...groups);
 }
 
 async function restoreLast() {
+  await loadCatalog();
   await refreshRecent();
-  setState("Загрузите прошивку FM-1 (.fwsc), например официальную V15 или Felucca");
+  // ?fw=felucca opens that firmware straight away (shareable links).
+  const wanted = new URL(location.href).searchParams.get("fw");
+  const entry = wanted && catalog.find((e) => e.id === wanted);
+  if (entry) bootCatalog(entry);
+  else setState("Выберите прошивку в списке сверху или откройте свой файл .fwsc");
 }
 
