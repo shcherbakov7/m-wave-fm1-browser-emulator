@@ -1,7 +1,9 @@
 // Fetch the newest builds of the open source FM-1 firmwares from their
-// authors' repositories into web/firmware/ and write web/firmware/catalog.json,
-// which the page offers as ready-to-run firmware. CI runs this before
-// packaging the site, so the site follows new releases.
+// authors' repositories (files kept in a branch, or GitHub release assets)
+// into web/firmware/ and write web/firmware/catalog.json, which the page
+// offers as ready-to-run firmware. CI runs this before packaging the site, so
+// the site follows new releases. Release lookups use the GitHub API
+// (GITHUB_TOKEN, when set, raises its rate limit).
 //
 // Only firmwares whose authors publish the .fwsc in their repository under a
 // free licence are copied. The official M-VAVE firmware is not copied: the
@@ -37,6 +39,31 @@ const SOURCES = [
     description: "Десять движков, восемь паттернов на дорожку, рабочие пространства STUDIO.",
   },
   {
+    id: "fomni", name: "FoMni", author: "Charles Vestal",
+    repo: "charlesvestal/fm1-fomni", branch: "gh-pages", pattern: /^firmware\/omni-([\d.]+)\.fwsc$/,
+    description: "Омникорд: аккорды под одной рукой, струнная пластина под другой.",
+  },
+  {
+    id: "jangada", name: "Jangada", author: "zednaked",
+    repo: "zednaked/jangada", release: /\.(fwsc|ufw)$/i,
+    description: "Ветка Felucca: superwave, матрица модуляции, дроны, рэтчеты, синтез-ударные.",
+  },
+  {
+    id: "choralroot", name: "ChoralRoot", author: "Quixotic7",
+    repo: "Quixotic7/ChoralRootFM1", release: /\.(fwsc|ufw)$/i,
+    description: "Аккордовый инструмент в духе Telepathic Orchid: корни одной рукой, аккорды другой.",
+  },
+  {
+    id: "fimba", name: "FiMba", author: "jadamsowers",
+    repo: "jadamsowers/fm1-fimba", release: /\.(fwsc|ufw)$/i,
+    description: "Калимба (пианино для больших пальцев) на FM-1.",
+  },
+  {
+    id: "nes", name: "fm1-nes", author: "Keitark", license: "Apache-2.0",
+    repo: "Keitark/fm1-nes", release: /\.(fwsc|ufw)$/i,
+    description: "Эмулятор NES на FM-1 (пример разработки своей прошивки).",
+  },
+  {
     id: "sloop-alg", name: "SLOOP ALG", author: "shaw-core",
     repo: "shaw-core/Sloop_ALG02", branch: "main", pattern: /^firmware\/sloop-(ALG\d+)-TEST\.fwsc$/,
     description: "Экспериментальная ветка SLOOP с движками DX7, VA, Karplus-Strong.",
@@ -65,9 +92,32 @@ function compareVersions(a, b) {
 
 const git = (dir, ...args) => execFileSync("git", ["-C", dir, ...args], { maxBuffer: 64 << 20 });
 
-mkdirSync(out, { recursive: true });
-const catalog = [OFFICIAL];
-for (const source of SOURCES) {
+/** The newest release with a matching asset: { version, date, bytes, name }. */
+async function fromRelease(source) {
+  const headers = { accept: "application/vnd.github+json", "user-agent": "fm1-emulator-site" };
+  if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const response = await fetch(`https://api.github.com/repos/${source.repo}/releases?per_page=20`, { headers });
+  if (!response.ok) throw new Error(`releases: HTTP ${response.status}`);
+  const releases = (await response.json())
+    .filter((release) => !release.draft)
+    .sort((a, b) => Date.parse(b.published_at ?? b.created_at) - Date.parse(a.published_at ?? a.created_at));
+  for (const release of releases) {
+    const asset = release.assets.find((a) => source.release.test(a.name));
+    if (!asset) continue;
+    const download = await fetch(asset.browser_download_url, { headers: { "user-agent": headers["user-agent"] } });
+    if (!download.ok) throw new Error(`${asset.name}: HTTP ${download.status}`);
+    return {
+      version: release.tag_name.replace(/^v(?=\d)/, ""),
+      date: (release.published_at ?? release.created_at).slice(0, 10),
+      bytes: Buffer.from(await download.arrayBuffer()),
+      extension: asset.name.match(/\.\w+$/)[0].toLowerCase(),
+    };
+  }
+  throw new Error("no release with a firmware file");
+}
+
+/** The newest matching file in a branch: { version, date, bytes }. */
+function fromBranch(source) {
   const dir = mkdtempSync(join(tmpdir(), "fm1-fw-"));
   try {
     git(dir, "init", "-q");
@@ -79,21 +129,33 @@ for (const source of SOURCES) {
       .sort((a, b) => compareVersions(a.version, b.version));
     const newest = builds.at(-1);
     if (!newest) throw new Error("no firmware file found");
-    const bytes = git(dir, "show", `FETCH_HEAD:${newest.path}`);
-    const date = git(dir, "log", "-1", "--format=%cs", "FETCH_HEAD").toString().trim();
-    const file = `${source.id}-${newest.version}.fwsc`;
-    writeFileSync(join(out, file), bytes);
+    return {
+      version: newest.version,
+      date: git(dir, "log", "-1", "--format=%cs", "FETCH_HEAD").toString().trim(),
+      bytes: git(dir, "show", `FETCH_HEAD:${newest.path}`),
+      extension: ".fwsc",
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+mkdirSync(out, { recursive: true });
+const catalog = [OFFICIAL];
+for (const source of SOURCES) {
+  try {
+    const build = source.release ? await fromRelease(source) : fromBranch(source);
+    const file = `${source.id}-${build.version.replace(/[^\w.-]/g, "_")}${build.extension}`;
+    writeFileSync(join(out, file), build.bytes);
     catalog.push({
-      id: source.id, name: source.name, version: newest.version, author: source.author,
-      description: source.description, file: `firmware/${file}`, size: bytes.length, date,
-      license: "GPL-3.0", source: `https://github.com/${source.repo}`,
+      id: source.id, name: source.name, version: build.version, author: source.author,
+      description: source.description, file: `firmware/${file}`, size: build.bytes.length, date: build.date,
+      license: source.license ?? "GPL-3.0", source: `https://github.com/${source.repo}`,
     });
-    console.log(`${source.name} ${newest.version} (${bytes.length} bytes, ${date})`);
+    console.log(`${source.name} ${build.version} (${build.bytes.length} bytes, ${build.date})`);
   } catch (error) {
     // One unreachable source must not take the site down.
     console.warn(`${source.name}: skipped (${error.message.split("\n")[0]})`);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
   }
 }
 writeFileSync(join(out, "catalog.json"), `${JSON.stringify(catalog, null, 2)}\n`);
