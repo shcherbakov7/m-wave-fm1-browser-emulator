@@ -4,6 +4,8 @@
 // same stamp, so a new deployment is never mixed with cached old files.
 const VERSION = new URL(import.meta.url).search;
 const { createPanel, ID } = await import(`./panel.js${VERSION}`);
+const { t, localized, language, translatePage, setLanguage, onLanguage, LANGUAGES } = await import(`./i18n.js${VERSION}`);
+translatePage();
 
 // Computer keyboard → panel control id. The 27-key keyboard starts on F.
 const KEYBOARD = new Map();
@@ -19,8 +21,12 @@ KEYBOARD.set("arrowleft", ID.OCT_DOWN);
 KEYBOARD.set("arrowright", ID.OCT_UP);
 KEYBOARD.set("escape", ID.HOME);
 KEYBOARD.set(" ", ID.PLAY);
-const KEY_NAMES = { arrowleft: "←", arrowright: "→", escape: "Esc", " ": "Пробел" };
-const keyHints = new Map([...KEYBOARD].map(([key, id]) => [id, KEY_NAMES[key] ?? key.toUpperCase()]));
+const KEY_NAMES = { arrowleft: "←", arrowright: "→", escape: "Esc", " ": "key.space" };
+const keyHints = new Map([...KEYBOARD].map(([key, id]) => [id, key]));
+const keyHint = (id) => {
+  const key = keyHints.get(id);
+  return key === undefined ? "" : key === " " ? t(KEY_NAMES[key]) : KEY_NAMES[key] ?? key.toUpperCase();
+};
 
 const $ = (id) => document.getElementById(id);
 const device = $("device");
@@ -28,7 +34,8 @@ const lcd = $("lcd").getContext("2d");
 const lcdImage = lcd.createImageData(240, 240);
 
 const panel = createPanel(device, {
-  keyHints,
+  t,
+  keyHint,
   onControl: (id, down) => worker.postMessage({ type: "key", id, down }),
   onEncoder: (index, steps) => worker.postMessage({ type: "encoder", index, steps }),
   onMaster: (value) => worker.postMessage({ type: "master", value }),
@@ -52,16 +59,19 @@ addEventListener("blur", releaseAll);
 // --- Emulator worker -------------------------------------------------------
 const worker = new Worker(`emulator-worker.js${VERSION}`, { type: "module" });
 let current = null; // { name, bytes }
+let lastInfo = null; // latest worker status
 let audio = null;   // { context, node }
+let paused = false;
 
 worker.onmessage = ({ data }) => {
   switch (data.type) {
     case "ready": showEngine(); restoreLast(); break;
     case "loaded":
-      setState(`Работает: ${data.name}`, "running");
+      setState("state.running", { name: data.name }, "running");
       $("drop-hint").classList.add("hidden");
       $("pause").disabled = $("restart").disabled = false;
-      $("pause").textContent = "Пауза";
+      paused = false;
+      showButtons();
       break;
     case "lcd":
       lcdImage.data.set(data.frame);
@@ -69,10 +79,16 @@ worker.onmessage = ({ data }) => {
       break;
     case "leds": panel.setLeds(data.leds); break;
     case "serial": appendSerial(data.text); break;
-    case "serial-busy": appendSerial("\n[консоль занята, повторите]\n"); break;
+    case "serial-busy": appendSerial(t("console.busy")); break;
     case "status": showStatus(data.info); break;
-    case "fault": setState(`Остановлено: ${data.message}`, "fault"); break;
-    case "error": setState(`Ошибка${data.name ? ` (${data.name})` : ""}: ${data.message}`, "fault"); break;
+    case "fault":
+      store.set("fm1-heartbeat", null);
+      setState("state.fault", { message: data.message }, "fault");
+      break;
+    case "error":
+      store.set("fm1-heartbeat", null);
+      setState(data.name ? "state.error-named" : "state.error", { name: data.name, message: data.message }, "fault");
+      break;
   }
 };
 // --- Engine mode and crash guard ---------------------------------------------
@@ -82,9 +98,9 @@ worker.onmessage = ({ data }) => {
 // steps down: no tail calls, then no translation at all. ?jit=0 and
 // ?chain=0 force a mode; ?jit=1 resets it.
 const MODES = [
-  { name: "полный (JIT с цепочками)", jit: true, chaining: true },
-  { name: "JIT без цепочек", jit: true, chaining: false },
-  { name: "только интерпретатор (медленно)", jit: false, chaining: false },
+  { name: "mode.full", jit: true, chaining: true },
+  { name: "mode.nochain", jit: true, chaining: false },
+  { name: "mode.interpreter", jit: false, chaining: false },
 ];
 const store = {
   get(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } },
@@ -92,7 +108,7 @@ const store = {
 };
 const params = new URL(location.href).searchParams;
 let level = store.get("fm1-mode") ?? 0;
-let modeNote = "";
+let crash = null; // the heartbeat a crashed run left, when it made this one step down
 // Other open tabs answer, so their heartbeat is not mistaken for a crash.
 const tabs = new BroadcastChannel("fm1-tabs");
 tabs.onmessage = ({ data }) => { if (data === "ping" && current) tabs.postMessage("pong"); };
@@ -106,45 +122,60 @@ const beat = store.get("fm1-heartbeat");
 if (beat && Date.now() - beat.time < 5 * 60_000 && beat.level >= level && level < MODES.length - 1
     && !(await otherTabRunning())) {
   level = beat.level + 1;
-  modeNote = `Прошлый запуск (${beat.firmware ?? "прошивка"}) завершился аварийно — включён режим «${MODES[level].name}».`;
+  crash = beat;
 }
 if (params.get("jit") === "0") level = 2;
 else if (params.get("chain") === "0") level = Math.max(level, 1);
 else if (params.get("jit") === "1") level = 0;
 store.set("fm1-mode", level);
-if (!beat || Date.now() - beat.time >= 5 * 60_000 || modeNote) store.set("fm1-heartbeat", null);
+if (!beat || Date.now() - beat.time >= 5 * 60_000 || crash) store.set("fm1-heartbeat", null);
 // WebKit (Safari, and every browser on iOS) has a small pool for compiled
 // code: keep the number of translated blocks alive within it.
 const webkit = /iPhone|iPad|iPod/.test(navigator.userAgent)
   || (/AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg/.test(navigator.userAgent));
 const mode = { ...MODES[level], blockLimit: webkit ? 1000 : 0 };
-// While a firmware runs, leave a heartbeat; a clean exit removes it.
+// While a firmware starts or runs, leave a heartbeat (with how far it got,
+// for the notice); a clean exit or a reported stop removes it. It is left
+// before loading, as most code is compiled in the first seconds.
+function heartbeat() {
+  store.set("fm1-heartbeat", {
+    time: Date.now(), level, firmware: current.name,
+    seconds: lastInfo?.guestSeconds ?? 0, blocks: lastInfo?.jit?.compiled ?? 0,
+  });
+}
 setInterval(() => {
-  if (current && $("state").classList.contains("running")) {
-    store.set("fm1-heartbeat", { time: Date.now(), level, firmware: current.name });
-  }
-}, 2000);
+  if (current && $("state").classList.contains("running")) heartbeat();
+}, 1000);
 addEventListener("pagehide", () => store.set("fm1-heartbeat", null));
 
 worker.postMessage({ type: "init", wasmUrl: new URL(`fm1.wasm${VERSION}`, location.href).href, mode });
 
-function setState(text, kind = "") {
+let shownState = null; // { key, params, kind }, redrawn on a language switch
+function setState(key, params = {}, kind = "") {
+  shownState = { key, params, kind };
   const state = $("state");
-  state.textContent = text;
+  state.textContent = t(key, params);
+  state.dataset.key = key;
   state.className = `state ${kind}`;
+}
+
+function showButtons() {
+  $("pause").textContent = t(paused ? "resume" : "pause");
+  $("sound").textContent = `${audio?.context.state === "running" ? "🔊" : "🔇"} ${t("sound")}`;
 }
 
 function showStatus(info) {
   if (!info.loaded) return;
+  lastInfo = info;
   const pct = info.realtime * 100;
-  $("speed").textContent = info.realtime ? `${pct < 10 ? pct.toFixed(1) : pct.toFixed(0)}% реального` : "—";
-  $("speed").title = `Загрузка эмулятора: ${(info.load * 100).toFixed(0)}% одного ядра`;
+  $("speed").textContent = info.realtime ? t("speed.value", { pct: pct < 10 ? pct.toFixed(1) : pct.toFixed(0) }) : "—";
+  $("speed").title = t("speed.title", { pct: (info.load * 100).toFixed(0) });
   $("steps").textContent = `${(info.steps / 1e6).toFixed(0)} M`;
-  $("guest-time").textContent = `${info.guestSeconds.toFixed(1)} с`;
-  $("irqs").textContent = info.irqs.toLocaleString("ru");
+  $("guest-time").textContent = t("seconds", { value: info.guestSeconds.toFixed(1) });
+  $("irqs").textContent = info.irqs.toLocaleString(language());
   showEngine(info);
-  if (info.paused && !info.fault) setState(`Пауза: ${current?.name ?? ""}`, "paused");
-  else if (!info.fault && current) setState(`Работает: ${current.name}`, "running");
+  if (info.paused && !info.fault) setState("state.paused", { name: current?.name ?? "" }, "paused");
+  else if (!info.fault && current) setState("state.running", { name: current.name }, "running");
 }
 
 /** Engine mode and browser, for reports (and the crash-guard notice). */
@@ -152,10 +183,16 @@ function showEngine(info = null) {
   const jit = info?.jit;
   const browser = navigator.userAgent.match(/(Version\/[\d.]+.*Safari|Chrome\/[\d.]+|Firefox\/[\d.]+|Edg\/[\d.]+)/)?.[0] ?? "";
   const platform = /iPhone|iPad/.test(navigator.userAgent) ? "iOS" : /Android/.test(navigator.userAgent) ? "Android" : "";
-  const details = jit ? ` · блоков ${jit.compiled}${mode.blockLimit ? ` (не больше ${mode.blockLimit})` : ""}, цепочки ${jit.chaining ? "вкл" : "выкл"}` : "";
-  $("engine").innerHTML = `${modeNote ? `<span class="engine-warn">${escape(modeNote)}</span><br>` : ""}
-    Режим: ${escape(mode.name)}${details} · ${escape([platform, browser].filter(Boolean).join(" "))}
-    ${level ? ` · <a href="?jit=1">вернуть полный режим</a>` : ""}`;
+  const details = jit ? ` · ${t("engine.blocks", { count: jit.compiled })}${mode.blockLimit ? ` ${t("engine.limit", { limit: mode.blockLimit })}` : ""}, ${t(jit.chaining ? "engine.chaining-on" : "engine.chaining-off")}` : "";
+  const note = crash && t("crash.note", {
+    firmware: crash.firmware ?? t("crash.firmware"),
+    mode: t(MODES[crash.level]?.name ?? ""),
+    when: crash.seconds ? t("crash.after", { seconds: crash.seconds.toFixed(1), blocks: crash.blocks }) : t("crash.at-start"),
+    next: t(mode.name),
+  });
+  $("engine").innerHTML = `${note ? `<span class="engine-warn">${escape(note)}</span><br>` : ""}
+    ${escape(t("engine.mode", { mode: t(mode.name) }))}${escape(details)} · ${escape([platform, browser].filter(Boolean).join(" "))}
+    ${level ? ` · <a href="?jit=1">${escape(t("engine.reset"))}</a>` : ""}`;
 }
 
 function appendSerial(text) {
@@ -170,9 +207,11 @@ let catalog = [];   // web/firmware/catalog.json (tools/update-firmware.mjs)
 /** Start `bytes`; `entry` is the catalog entry it came from, if any. */
 function boot(name, bytes, entry = null) {
   current = { name, bytes, entry };
+  lastInfo = null;
+  heartbeat();
   releaseAll();
   $("serial").textContent = "";
-  setState(`Загрузка ${name}…`);
+  setState("state.loading", { name });
   showAbout(entry);
   worker.postMessage({ type: "load", name, bytes: bytes.slice(0) });
   if (!entry) remember(name, bytes).then(refreshRecent);
@@ -185,29 +224,34 @@ function boot(name, bytes, entry = null) {
 
 async function openFile(file) {
   if (!file) return;
-  if (file.size > 16 * 1024 * 1024) { setState("Файл слишком большой для прошивки FM-1", "fault"); return; }
+  if (file.size > 16 * 1024 * 1024) { setState("state.too-big", {}, "fault"); return; }
   boot(file.name, await file.arrayBuffer());
 }
 
 const escape = (text) => String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
-function showAbout(entry, error = "") {
+let shownAbout = [null]; // showAbout's arguments, redrawn on a language switch
+
+/** Describe a catalog entry; `error()` returns a problem to show above, as HTML. */
+function showAbout(entry, error = null) {
+  shownAbout = [entry, error];
   const about = $("about");
   about.hidden = !entry;
   if (!entry) return;
   const link = entry.source ?? entry.page;
-  about.innerHTML = `${error ? `<p class="about-error">${error}</p>` : ""}
-    <strong>${escape(entry.name)} ${escape(entry.version)}</strong> — ${escape(entry.author)}<br>
-    ${escape(entry.description)}<br>
-    ${entry.check ? `<small>${entry.check.ok ? "✓ проверена в эмуляторе при сборке сайта" : `⚠ в эмуляторе останавливается: ${escape(entry.check.stop || "экран пуст")}`}</small><br>` : ""}
-    <small>${escape(entry.license)}${entry.date ? ` · ${escape(entry.date)}` : ""} ·
-    <a href="${escape(link)}" target="_blank" rel="noopener">${entry.source ? "исходники и инструкции" : "страница загрузки"}</a></small>`;
+  const check = entry.check && (entry.check.ok ? t("about.checked") : t("about.stops", { reason: entry.check.stop || t("about.blank") }));
+  about.innerHTML = `${error ? `<p class="about-error">${error()}</p>` : ""}
+    <strong>${escape(localized(entry.name))} ${escape(entry.version)}</strong> — ${escape(entry.author)}<br>
+    ${escape(localized(entry.description))}<br>
+    ${check ? `<small>${escape(check)}</small><br>` : ""}
+    <small>${escape(localized(entry.license))}${entry.date ? ` · ${escape(entry.date)}` : ""} ·
+    <a href="${escape(link)}" target="_blank" rel="noopener">${escape(t(entry.source ? "about.source" : "about.page"))}</a></small>`;
 }
 
 /** Download a catalog firmware and start it. */
 async function bootCatalog(entry) {
-  const name = `${entry.name} ${entry.version}`;
-  setState(`Скачивание ${name}…`);
+  const name = `${localized(entry.name)} ${entry.version}`;
+  setState("state.downloading", { name });
   showAbout(entry);
   try {
     const response = await fetch(entry.file ?? entry.url, { cache: "force-cache" });
@@ -215,15 +259,13 @@ async function bootCatalog(entry) {
     boot(name, await response.arrayBuffer(), entry);
   } catch (error) {
     if (current) {
-      showAbout(entry, `Не удалось скачать ${escape(name)}, работает прежняя прошивка. ` + (entry.url
-        ? `Сервер M-VAVE не отдаёт файл другим сайтам: скачайте <a href="${escape(entry.url)}">FM-1.fwsc</a> и откройте его кнопкой «Свой файл».`
-        : escape(String(error))));
+      showAbout(entry, () => `${escape(t("download.failed-running", { name }))} ${entry.url
+        ? t("download.mvave-short", { url: escape(entry.url) })
+        : escape(String(error))}`);
       return;
     }
-    setState(`Не удалось скачать ${name}`, "fault");
-    showAbout(entry, entry.url
-      ? `Сервер M-VAVE не отдаёт файл другим сайтам. Скачайте <a href="${escape(entry.url)}">FM-1.fwsc</a> с официального сервера и откройте его кнопкой «Свой файл» — дальше он будет в списке «Недавние».`
-      : escape(String(error)));
+    setState("state.download-failed", { name }, "fault");
+    showAbout(entry, () => (entry.url ? t("download.mvave", { url: escape(entry.url) }) : escape(String(error))));
   }
 }
 
@@ -248,8 +290,8 @@ document.addEventListener("drop", (event) => {
 });
 
 $("pause").addEventListener("click", () => {
-  const paused = $("pause").textContent === "Пауза";
-  $("pause").textContent = paused ? "Продолжить" : "Пауза";
+  paused = !paused;
+  showButtons();
   worker.postMessage({ type: "pause", paused });
 });
 $("restart").addEventListener("click", () => current && boot(current.name, current.bytes));
@@ -283,14 +325,12 @@ $("sound").addEventListener("click", async () => {
     node.port.postMessage({ port: port1 }, [port1]);
     worker.postMessage({ type: "audio-port", port: port2 }, [port2]);
     audio = { context, node };
-    $("sound").textContent = "🔊 Звук";
   } else if (audio.context.state === "running") {
     await audio.context.suspend();
-    $("sound").textContent = "🔇 Звук";
   } else {
     await audio.context.resume();
-    $("sound").textContent = "🔊 Звук";
   }
+  showButtons();
 });
 
 function database(mode, action) {
@@ -320,11 +360,11 @@ async function refreshRecent() {
     return element;
   };
   const official = catalog.filter((e) => e.url), open = catalog.filter((e) => e.file);
-  const groups = [new Option("Выбрать прошивку…", "")];
-  if (official.length) groups.push(group("Официальная", official.map((e) => new Option(`${e.name} ${e.version}`, `c:${e.id}`))));
+  const groups = [new Option(t("firmware.choose"), "")];
+  if (official.length) groups.push(group(t("firmware.official"), official.map((e) => new Option(`${localized(e.name)} ${e.version}`, `c:${e.id}`))));
   const mark = (e) => (e.check && !e.check.ok ? " ⚠" : "");
-  if (open.length) groups.push(group("Открытые прошивки", open.map((e) => new Option(`${e.name} ${e.version} — ${e.author}${mark(e)}`, `c:${e.id}`))));
-  if (saved.length) groups.push(group("Ваши файлы (недавние)", saved.map((e) => new Option(e.name, `r:${e.name}`))));
+  if (open.length) groups.push(group(t("firmware.open"), open.map((e) => new Option(`${localized(e.name)} ${e.version} — ${e.author}${mark(e)}`, `c:${e.id}`))));
+  if (saved.length) groups.push(group(t("firmware.recent"), saved.map((e) => new Option(e.name, `r:${e.name}`))));
   $("firmware").replaceChildren(...groups);
   showFirmwareList(saved);
 }
@@ -342,15 +382,15 @@ function showFirmwareList(saved = []) {
   const items = catalog.map((entry) => {
     const active = current?.entry?.id === entry.id ? "active" : "";
     const warn = entry.check && !entry.check.ok ? " ⚠" : "";
-    return button(`${entry.name}${warn}`, `${entry.version} · ${entry.author}`, () => bootCatalog(entry), active);
+    return button(`${localized(entry.name)}${warn}`, `${entry.version} · ${entry.author}`, () => bootCatalog(entry), active);
   });
   for (const file of saved.slice(0, 4)) {
-    items.push(button(file.name, "ваш файл", async () => {
+    items.push(button(file.name, t("list.yours"), async () => {
       const entry = await database("readonly", (store) => store.get(file.name));
       if (entry) boot(entry.name, entry.bytes);
     }, current?.name === file.name ? "active" : ""));
   }
-  items.push(button("Свой файл…", ".fwsc с устройства", () => $("file").click(), "own"));
+  items.push(button(t("list.own"), t("list.own.detail"), () => $("file").click(), "own"));
   $("firmware-list").replaceChildren(...items);
 }
 
@@ -361,6 +401,32 @@ async function restoreLast() {
   const wanted = new URL(location.href).searchParams.get("fw");
   const entry = wanted && catalog.find((e) => e.id === wanted);
   if (entry) bootCatalog(entry);
-  else setState("Выберите прошивку в списке сверху или откройте свой файл .fwsc");
+  else setState("state.choose");
 }
+
+// --- Language switch ---------------------------------------------------------
+function showLanguages() {
+  $("lang").replaceChildren(...Object.entries(LANGUAGES).map(([code, label]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "button";
+    button.textContent = label;
+    button.lang = code;
+    button.setAttribute("aria-pressed", String(code === language()));
+    button.addEventListener("click", () => setLanguage(code));
+    return button;
+  }));
+}
+showLanguages();
+setState("state.none");
+showButtons();
+onLanguage(() => {
+  showLanguages();
+  showButtons();
+  if (shownState) setState(shownState.key, shownState.params, shownState.kind);
+  if (lastInfo) showStatus(lastInfo); else showEngine();
+  showAbout(...shownAbout);
+  panel.relabel();
+  refreshRecent();
+});
 

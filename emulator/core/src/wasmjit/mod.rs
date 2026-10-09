@@ -79,9 +79,11 @@ pub struct Block {
 
 /// Longest straight-line run translated into one basic block.
 const MAX_INSTRUCTIONS: u32 = 48;
-/// Basic blocks and instructions in one translated region.
-const MAX_BLOCKS: usize = 48;
-const MAX_REGION_INSTRUCTIONS: u32 = 768;
+/// Basic blocks and instructions in one translated region. Larger regions
+/// are no faster but cost engines (WebKit above all) far more memory and
+/// executable code to compile, as regions entered at different PCs overlap.
+const MAX_BLOCKS: usize = 16;
+const MAX_REGION_INSTRUCTIONS: u32 = 256;
 /// A region returns to the host at an internal branch once it has run this
 /// many instructions, so devices and interrupts stay current.
 const BUDGET: u32 = 256;

@@ -25,7 +25,7 @@ const errors = [];
 page.on("pageerror", (error) => errors.push(String(error)));
 page.on("console", (message) => message.type() === "error" && errors.push(message.text()));
 await page.goto(url);
-await page.waitForFunction(() => document.getElementById("state").textContent.startsWith("Выберите"));
+await page.waitForFunction(() => document.getElementById("state").dataset.key === "state.choose");
 await page.setInputFiles("#file", firmware);
 
 // Wait until the guest has drawn to its screen (or faulted).
@@ -40,10 +40,10 @@ while (Date.now() < deadline) {
       for (let i = 0; i < data.length; i += 4) if (data[i] | data[i + 1] | data[i + 2]) count++;
       return count;
     })();
-    return JSON.stringify({ state: document.getElementById("state").textContent, steps: document.getElementById("steps").textContent, speed: document.getElementById("speed").textContent, lit });
+    return JSON.stringify({ state: document.getElementById("state").textContent, fault: document.getElementById("state").classList.contains("fault"), steps: document.getElementById("steps").textContent, speed: document.getElementById("speed").textContent, lit });
   });
   const parsed = JSON.parse(state);
-  if (parsed.state.startsWith("Остановлено") || parsed.state.startsWith("Ошибка") || parsed.lit > 2000) break;
+  if (parsed.fault || parsed.lit > 2000) break;
 }
 // SETTLE=seconds: keep running after boot, then report the speed again.
 if (process.env.SETTLE) {
