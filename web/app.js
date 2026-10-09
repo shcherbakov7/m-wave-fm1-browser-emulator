@@ -52,6 +52,7 @@ addEventListener("blur", releaseAll);
 // --- Emulator worker -------------------------------------------------------
 const worker = new Worker(`emulator-worker.js${VERSION}`, { type: "module" });
 let current = null; // { name, bytes }
+let lastInfo = null; // latest worker status
 let audio = null;   // { context, node }
 
 worker.onmessage = ({ data }) => {
@@ -71,8 +72,14 @@ worker.onmessage = ({ data }) => {
     case "serial": appendSerial(data.text); break;
     case "serial-busy": appendSerial("\n[консоль занята, повторите]\n"); break;
     case "status": showStatus(data.info); break;
-    case "fault": setState(`Остановлено: ${data.message}`, "fault"); break;
-    case "error": setState(`Ошибка${data.name ? ` (${data.name})` : ""}: ${data.message}`, "fault"); break;
+    case "fault":
+      store.set("fm1-heartbeat", null);
+      setState(`Остановлено: ${data.message}`, "fault");
+      break;
+    case "error":
+      store.set("fm1-heartbeat", null);
+      setState(`Ошибка${data.name ? ` (${data.name})` : ""}: ${data.message}`, "fault");
+      break;
   }
 };
 // --- Engine mode and crash guard ---------------------------------------------
@@ -106,7 +113,8 @@ const beat = store.get("fm1-heartbeat");
 if (beat && Date.now() - beat.time < 5 * 60_000 && beat.level >= level && level < MODES.length - 1
     && !(await otherTabRunning())) {
   level = beat.level + 1;
-  modeNote = `Прошлый запуск (${beat.firmware ?? "прошивка"}) завершился аварийно — включён режим «${MODES[level].name}».`;
+  const when = beat.seconds ? `через ${beat.seconds.toFixed(1)} с работы, блоков ${beat.blocks}` : "при запуске";
+  modeNote = `Прошлый запуск (${beat.firmware ?? "прошивка"}, режим «${MODES[beat.level]?.name}») завершился аварийно ${when} — включён режим «${MODES[level].name}».`;
 }
 if (params.get("jit") === "0") level = 2;
 else if (params.get("chain") === "0") level = Math.max(level, 1);
@@ -118,12 +126,18 @@ if (!beat || Date.now() - beat.time >= 5 * 60_000 || modeNote) store.set("fm1-he
 const webkit = /iPhone|iPad|iPod/.test(navigator.userAgent)
   || (/AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg/.test(navigator.userAgent));
 const mode = { ...MODES[level], blockLimit: webkit ? 1000 : 0 };
-// While a firmware runs, leave a heartbeat; a clean exit removes it.
+// While a firmware starts or runs, leave a heartbeat (with how far it got,
+// for the notice); a clean exit or a reported stop removes it. It is left
+// before loading, as most code is compiled in the first seconds.
+function heartbeat() {
+  store.set("fm1-heartbeat", {
+    time: Date.now(), level, firmware: current.name,
+    seconds: lastInfo?.guestSeconds ?? 0, blocks: lastInfo?.jit?.compiled ?? 0,
+  });
+}
 setInterval(() => {
-  if (current && $("state").classList.contains("running")) {
-    store.set("fm1-heartbeat", { time: Date.now(), level, firmware: current.name });
-  }
-}, 2000);
+  if (current && $("state").classList.contains("running")) heartbeat();
+}, 1000);
 addEventListener("pagehide", () => store.set("fm1-heartbeat", null));
 
 worker.postMessage({ type: "init", wasmUrl: new URL(`fm1.wasm${VERSION}`, location.href).href, mode });
@@ -136,6 +150,7 @@ function setState(text, kind = "") {
 
 function showStatus(info) {
   if (!info.loaded) return;
+  lastInfo = info;
   const pct = info.realtime * 100;
   $("speed").textContent = info.realtime ? `${pct < 10 ? pct.toFixed(1) : pct.toFixed(0)}% реального` : "—";
   $("speed").title = `Загрузка эмулятора: ${(info.load * 100).toFixed(0)}% одного ядра`;
@@ -170,6 +185,8 @@ let catalog = [];   // web/firmware/catalog.json (tools/update-firmware.mjs)
 /** Start `bytes`; `entry` is the catalog entry it came from, if any. */
 function boot(name, bytes, entry = null) {
   current = { name, bytes, entry };
+  lastInfo = null;
+  heartbeat();
   releaseAll();
   $("serial").textContent = "";
   setState(`Загрузка ${name}…`);
