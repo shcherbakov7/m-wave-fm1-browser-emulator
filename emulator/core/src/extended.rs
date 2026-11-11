@@ -393,13 +393,14 @@ pub(crate) fn execute(
                 }
                 Wide::ShiftWideRegister => {
                     let value = cpu.r[d] as u64 | ((cpu.r[d + 1] as u64) << 32);
-                    let shift = cpu.r[c];
-                    let result = if x & 2 == 0 {
-                        value.checked_shl(shift)
-                    } else {
-                        value.checked_shr(shift)
-                    }
-                    .unwrap_or(0);
+                    // The count is the register's low byte; 64..255 saturate (hardware results in
+                    // jvitkauskas/pi32v2-isa hw/*/results.jsonl: a count of 256 leaves the pair as it was).
+                    let shift = cpu.r[c] & 255;
+                    let result = match x & 3 {
+                        0 => value.checked_shl(shift).unwrap_or(0),
+                        2 => value.checked_shr(shift).unwrap_or(0),
+                        _ => ((value as i64) >> shift.min(63)) as u64,
+                    };
                     cpu.r[d] = result as u32;
                     cpu.r[d + 1] = (result >> 32) as u32;
                     op = "shift_wide_register";
@@ -821,7 +822,9 @@ pub(crate) fn execute(
                     op = "logic_immediate";
                 }
                 Wide::StoreImmediate => {
-                    cpu.write(cpu.r[d].wrapping_add((h & 31) * 4), packed(x))?;
+                    // The offset is six bits, signed: 0xea7f is [rX + -4].
+                    let offset = crate::cpu::signed(h & 63, 6) * 4;
+                    cpu.write(cpu.r[d].wrapping_add(offset as u32), packed(x))?;
                     op = "store_immediate";
                 }
                 Wide::AddImmediate => {

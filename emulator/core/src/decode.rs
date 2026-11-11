@@ -412,7 +412,7 @@ fn wide(h: u32, x: u32) -> Wide {
     if h == 0xe1f6 && d & 1 == 0 && s & 1 == 0 && x & 15 <= 1 {
         return Wide::DivideWide;
     }
-    if h == 0xe1d8 && d & 1 == 0 && s == 0 && matches!(x & 15, 0 | 2) {
+    if h == 0xe1d8 && d & 1 == 0 && s == 0 && matches!(x & 15, 0 | 2 | 3) {
         return Wide::ShiftWideRegister;
     }
     if h == 0xe1d0 && d & 1 == 0 && s == 0 && (x >> 10) & 3 != 1 {
@@ -534,7 +534,7 @@ fn wide(h: u32, x: u32) -> Wide {
     if matches!(h & 0xfff0, 0xe140 | 0xe150 | 0xe160 | 0xe170) {
         return Wide::LogicImmediate;
     }
-    if h & 0xffe0 == 0xea40 {
+    if h & 0xffc0 == 0xea40 {
         return Wide::StoreImmediate;
     }
     if matches!(h & 0xfff0, 0xe100 | 0xe110 | 0xe120 | 0xe130 | 0xe0e0) {
