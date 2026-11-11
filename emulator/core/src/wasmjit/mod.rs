@@ -1805,7 +1805,8 @@ fn wide_instruction(
         }
         Wide::StoreImmediate => {
             t.r(d);
-            t.body.u32((h & 31) * 4).op(I32_ADD).set(ADDR);
+            let offset = signed(h & 63, 6) * 4;
+            t.body.u32(offset as u32).op(I32_ADD).set(ADDR);
             t.fast(0, 4, 4, true);
             t.body.if_().u32(packed(x)).set(VALUE);
             t.store_at(0, 4, VALUE);

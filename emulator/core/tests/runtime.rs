@@ -1065,6 +1065,42 @@ fn stock_wide_arithmetic_preserves_high_words_and_overlapping_operands() {
 }
 
 #[test]
+fn wide_arithmetic_shift_and_negative_constant_stores() {
+    // r1_r0 >>>= r4 (kind 3): the JieLi compiler emits it for a signed 64-bit
+    // shift. The count is the register's low byte; 64..255 fill with the sign
+    // (jvitkauskas/pi32v2-isa hw/*/results.jsonl).
+    for value in [0x81234567fedcba98u64, 0x01234567fedcba98] {
+        for shift in [0u32, 1, 32, 63, 64, 255, 256, 257] {
+            let mut c = cpu(&[0xe1d8, 0x0403]);
+            c.r[0] = value as u32;
+            c.r[1] = (value >> 32) as u32;
+            c.r[4] = shift;
+            c.step().unwrap();
+            let expected = (value as i64 >> (shift & 255).min(63)) as u64;
+            assert_eq!(
+                (c.r[1] as u64) << 32 | c.r[0] as u64,
+                expected,
+                "{value:x} >>> {shift}"
+            );
+        }
+    }
+    // [r1 + 4 * offset] = 0x5a, the offset six bits signed: 0xea7f is -4.
+    let stores = [
+        (0xea40u16, 0i32),
+        (0xea5f, 124),
+        (0xea60, -128),
+        (0xea7f, -4),
+    ];
+    for (h, offset) in stores {
+        let mut c = cpu(&[h, 0x105a]);
+        c.r[1] = RAM + 256;
+        c.step().unwrap();
+        let address = (RAM + 256).wrapping_add(offset as u32);
+        assert_eq!(c.bus.read(address, 4).unwrap(), 0x5a, "{h:x}");
+    }
+}
+
+#[test]
 fn stock_cache_bound_keeps_unsigned_long_branch_immediates_positive() {
     // Vendor display startup at 0x0200205a: if (r2 < 2111) goto -22.
     for (condition, value, taken) in [
